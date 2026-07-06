@@ -1,0 +1,62 @@
+[
+  {
+    "id": "happy-path-quantum-research",
+    "name": "Happy Path",
+    "description": "Research the top 5 breakthroughs in quantum computing from 2024-2025. For each breakthrough, explain the technology, the research team, and potential real-world applications. Compile into a structured summary report.",
+    "expected_steps": "4-5",
+    "expected_duration": "~2 minutes",
+    "demonstrates": [
+      "Task decomposition",
+      "Web search tool usage",
+      "Multi-step synthesis",
+      "Final structured report generation"
+    ],
+    "chaos_mode": false,
+    "talking_points": [
+      "The planner breaks one complex request into clear, sequential sub-goals.",
+      "Each step can use a different capability, but context is preserved end-to-end.",
+      "The execution graph shows progression from planning to completion in real time.",
+      "The final result includes both synthesized content and an execution confidence signal."
+    ]
+  },
+  {
+    "id": "failure-recovery-weather-comparison",
+    "name": "Failure Recovery",
+    "description": "Find the current weather in New York, Tokyo, London, Sydney, and Cairo. Compare the temperatures, identify the hottest and coldest cities, and recommend the best city to visit today based on weather.",
+    "expected_steps": "3-4 (with 2-3 retries expected)",
+    "expected_duration": "~3 minutes",
+    "demonstrates": [
+      "API call steps",
+      "Retry mechanism with backoff",
+      "Provider fallback chain",
+      "Partial-result resilience under transient failures"
+    ],
+    "chaos_mode": true,
+    "talking_points": [
+      "Chaos mode intentionally injects failures so we can prove reliability behavior live.",
+      "You should see retry and fallback events in trace and logs without manual intervention.",
+      "Even with injected faults, the system converges to a usable recommendation.",
+      "This demonstrates production behavior under degraded conditions, not just best-case success."
+    ]
+  },
+  {
+    "id": "reflection-demo-bst-code-task",
+    "name": "Reflection Demo",
+    "description": "Write a Python function that implements a binary search tree with insert, search, and delete operations. Then write unit tests for it. Finally, document the code with docstrings and complexity analysis.",
+    "expected_steps": "4-5 (possible reflection)",
+    "expected_duration": "~3 minutes",
+    "demonstrates": [
+      "Code generation workflow",
+      "Validation and quality gating",
+      "Reflection and self-correction",
+      "Recovery from flawed intermediate outputs"
+    ],
+    "chaos_mode": false,
+    "talking_points": [
+      "This scenario is about quality correction, not infrastructure failure handling.",
+      "If validation detects weak output, the reflector can rewrite or decompose the step.",
+      "The timeline exposes why the correction happened and what action was taken.",
+      "Optional light chaos can be enabled in rehearsal, but default demo run keeps chaos off."
+    ]
+  }
+]
