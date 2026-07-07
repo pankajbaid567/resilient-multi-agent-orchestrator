@@ -49,8 +49,6 @@ services:
     staticPublishPath: "./frontend/dist"
     envVars:
 
+      # The backend's public URL (e.g. https://reliable-agent-backend-emlv.onrender.com)
       - key: VITE_API_URL
-        fromService:
-          type: web
-          name: reliable-agent-backend
-          property: host
+        sync: false
