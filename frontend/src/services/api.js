@@ -7,7 +7,7 @@ if (apiUrl && !apiUrl.startsWith("http")) {
 
 const apiClient = axios.create({
   baseURL: apiUrl,
-  timeout: 30000,
+  timeout: 0, // No timeout to accommodate Render cold starts
   headers: {
     "Content-Type": "application/json",
   },
