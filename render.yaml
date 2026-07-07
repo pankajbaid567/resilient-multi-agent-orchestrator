@@ -30,11 +30,11 @@ services:
       - key: OPEN_SOURCE_BASE_URL
         value: "https://router.huggingface.co/v1"
       - key: PRIMARY_MODEL
-        value: "meta-llama/llama-3.1-8b-instruct:free"
+        value: "meta-llama/Llama-3.1-8B-Instruct"
       - key: FALLBACK_MODEL
-        value: "qwen/qwen-2.5-7b-instruct:free"
+        value: "Qwen/Qwen2.5-7B-Instruct"
       - key: VALIDATION_MODEL
-        value: "qwen/qwen-2.5-7b-instruct:free"
+        value: "Qwen/Qwen2.5-7B-Instruct"
       # Securely sync API keys in the Render Dashboard
       - key: OPEN_SOURCE_API_KEY
         sync: false
