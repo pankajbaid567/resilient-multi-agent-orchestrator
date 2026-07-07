@@ -1,9 +1,5 @@
 services:
-  # Redis Cache
-  - type: redis
-    name: reliable-agent-redis
-    plan: free
-    ipAllowList: [] # internal only
+
 
   # FastAPI Backend
   - type: web
@@ -14,11 +10,9 @@ services:
     buildCommand: "cd backend && pip install -r requirements.txt"
     startCommand: "cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT"
     envVars:
+      # Securely sync existing Redis instance URL
       - key: REDIS_URL
-        fromService:
-          type: redis
-          name: reliable-agent-redis
-          property: connectionString
+        sync: false
       - key: MAX_CONCURRENT_STEPS
         value: "5"
       - key: STEP_TIMEOUT
