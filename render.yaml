@@ -1,0 +1,44 @@
+services:
+  # Redis Cache
+  - type: redis
+    name: reliable-agent-redis
+    plan: free
+    ipAllowList: [] # internal only
+
+  # FastAPI Backend
+  - type: web
+    name: reliable-agent-backend
+    env: python
+    plan: free
+    region: ohio
+    buildCommand: "cd backend && pip install -r requirements.txt"
+    startCommand: "cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: REDIS_URL
+        fromService:
+          type: redis
+          name: reliable-agent-redis
+          property: connectionString
+      - key: MAX_CONCURRENT_STEPS
+        value: "5"
+      - key: STEP_TIMEOUT
+        value: "90"
+      # Securely sync this variable in the Render Dashboard
+      - key: OPEN_SOURCE_API_KEY
+        sync: false
+
+  # React Frontend
+  - type: web
+    name: reliable-agent-frontend
+    env: static
+    plan: free
+    region: ohio
+    buildCommand: "cd frontend && npm install && npm run build"
+    staticPublishPath: "./frontend/dist"
+    envVars:
+
+      - key: VITE_API_URL
+        fromService:
+          type: web
+          name: reliable-agent-backend
+          property: url
