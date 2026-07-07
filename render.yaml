@@ -32,7 +32,6 @@ services:
     name: reliable-agent-frontend
     env: static
     plan: free
-    region: ohio
     buildCommand: "cd frontend && npm install && npm run build"
     staticPublishPath: "./frontend/dist"
     envVars:
@@ -41,4 +40,4 @@ services:
         fromService:
           type: web
           name: reliable-agent-backend
-          property: url
+          property: host
