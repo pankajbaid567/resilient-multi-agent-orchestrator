@@ -10,8 +10,10 @@ from typing import Awaitable, Callable, Optional, TypeVar
 from services.llm_service import (
     LLMConnectionError,
     LLMRateLimitError,
+    LLMRequestError,
     LLMResponse,
     LLMResponseError,
+    LLMServerError,
     LLMTimeoutError,
     call_llm,
 )
@@ -30,18 +32,22 @@ class MaxRetriesExceededError(Exception):
         super().__init__(f"Failed after {attempts} attempts. Last error: {last_error}")
 
 
+# Transient failures: the same request may succeed later. An empty/invalid body
+# (LLMResponseError) is included because sampling can produce a usable answer next time.
 RETRYABLE_EXCEPTIONS = (
     LLMTimeoutError,
     LLMRateLimitError,
     LLMConnectionError,
+    LLMServerError,
     LLMResponseError,
     asyncio.TimeoutError,
     ConnectionError,
     TimeoutError,
 )
 
+# Deterministic failures: retrying the identical request cannot change the outcome.
 NON_RETRYABLE_EXCEPTIONS = (
-    LLMResponseError,
+    LLMRequestError,
     ValueError,
     KeyError,
     TypeError,

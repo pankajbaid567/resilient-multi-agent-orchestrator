@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import logging
-from typing import Any
 
 from agent.state import AgentState
 from config import get_settings
@@ -19,6 +18,18 @@ MODEL_COST_RATES = {
     "gpt-4o-mini": {"input_per_million": 0.15, "output_per_million": 0.60},
     "claude-3-5-sonnet": {"input_per_million": 3.00, "output_per_million": 15.00},
 }
+
+
+def final_result_per_step(state: AgentState) -> list:
+    """Return the last recorded result for each step.
+
+    A step can leave several results (a failed attempt, then a skip after reflection);
+    only the final one says how the step ended, so counting all of them double-penalises.
+    """
+    latest: dict[str, object] = {}
+    for result in state["step_results"]:
+        latest[result.step_id] = result
+    return list(latest.values())
 
 
 def compute_confidence(state: AgentState) -> str:
@@ -36,8 +47,9 @@ def compute_confidence(state: AgentState) -> str:
     """
     score = 100
 
-    failed_steps = sum(1 for result in state["step_results"] if result.status == "failed")
-    skipped_steps = sum(1 for result in state["step_results"] if result.status == "skipped")
+    final_results = final_result_per_step(state)
+    failed_steps = sum(1 for result in final_results if result.status == "failed")
+    skipped_steps = sum(1 for result in final_results if result.status == "skipped")
     total_retries = sum(state["retry_counts"].values())
     total_reflections = sum(state["reflection_counts"].values())
 
@@ -65,9 +77,14 @@ async def finalizer_node(state: AgentState) -> AgentState:
             state["llm_tokens_used"] += synthesis_tokens
 
         total_steps = len(state["steps"])
-        successful_steps = sum(1 for result in state["step_results"] if result.status == "success")
-        failed_steps = sum(1 for result in state["step_results"] if result.status == "failed")
-        skipped_steps = sum(1 for result in state["step_results"] if result.status == "skipped")
+        final_results = final_result_per_step(state)
+        successful_steps = sum(1 for result in final_results if result.status == "success")
+        failed_steps = sum(1 for result in final_results if result.status == "failed")
+        skipped_steps = sum(1 for result in final_results if result.status == "skipped")
+        not_run_steps = max(0, total_steps - len(final_results))
+        # "partial" tells the reader some steps did not produce a verified result, even
+        # when the task status is "completed".
+        outcome = "complete" if successful_steps == total_steps and total_steps > 0 else "partial"
         total_retries = sum(state["retry_counts"].values())
         total_reflections = sum(state["reflection_counts"].values())
 
@@ -80,6 +97,8 @@ async def finalizer_node(state: AgentState) -> AgentState:
             "successful_steps": successful_steps,
             "failed_steps": failed_steps,
             "skipped_steps": skipped_steps,
+            "not_run_steps": not_run_steps,
+            "outcome": outcome,
             "total_retries": total_retries,
             "total_reflections": total_reflections,
             "total_tokens": state["llm_tokens_used"],

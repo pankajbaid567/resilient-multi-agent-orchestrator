@@ -45,6 +45,8 @@ Respond with JSON only:
   "scores": {{"relevance": N, "completeness": N, "consistency": N, "plausibility": N}}
 }}"""
 
+MAX_JUDGED_OUTPUT_CHARS = 6_000
+
 HALLUCINATION_MARKERS = [
     "As an AI",
     "I cannot",
@@ -106,13 +108,31 @@ async def validator_node(state: AgentState) -> AgentState:
     reason = "Validation fallback applied"
     scores: dict[str, int] = {}
 
+    if latest_result.status != "success" or not output_text.strip():
+        # Nothing to judge: an LLM call on an empty or failed output only costs tokens.
+        verdict = "retry"
+        reason = f"Step produced no usable output: {latest_result.error or 'empty output'}"
+        latest_result.validation = verdict
+        _append_validator_log(state=state, step_id=latest_result.step_id, verdict=verdict, reason=reason, scores={})
+        state["execution_trace"].append(
+            TraceEntry(
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                event_type="step_failed",
+                step_id=latest_result.step_id,
+                step_name=step_name,
+                details={"validator_verdict": verdict, "validator_reason": reason, "judge_skipped": True},
+                error=reason,
+            ).model_dump()
+        )
+        return state
+
     try:
         model_name = _get_validation_model()
         provider_name = _provider_for_model(model_name)
         validation_prompt = VALIDATOR_USER_PROMPT_TEMPLATE.format(
             step_name=step_name,
             step_description=step_description,
-            step_output=output_text,
+            step_output=output_text[:MAX_JUDGED_OUTPUT_CHARS],
         )
 
         llm_response = await call_llm(
@@ -125,6 +145,7 @@ async def validator_node(state: AgentState) -> AgentState:
             json_mode=True,
             timeout=45,
         )
+        state["llm_tokens_used"] += llm_response.tokens_used
         parsed = _parse_validation_response(llm_response.text)
         verdict = parsed["verdict"]
         reason = parsed["reason"]
@@ -273,8 +294,11 @@ def _append_validator_log(
     reason: str,
     scores: dict[str, int],
 ) -> None:
-    """Append validator metadata used by graph routing and observability."""
-    state["error_log"].append(
+    """Append validator metadata used by graph routing, prompts and metrics.
+
+    Verdicts live in validation_log, not error_log: a passing verdict is not an error.
+    """
+    state.setdefault("validation_log", []).append(
         {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "step_id": step_id,

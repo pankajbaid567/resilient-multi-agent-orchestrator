@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
     # Security switches. Both tools act on the server's behalf, so they are off unless an
     # operator turns them on for a trusted, private deployment.
+    # Per-task limits: the run stops and reports partial results when either is reached
+    # (0 disables the limit).
+    TASK_TOKEN_BUDGET: int = 60_000
+    TASK_DEADLINE_SECONDS: int = 600
     ENABLE_CODE_EXEC: bool = False
     ENABLE_API_CALL: bool = False
     ADMIN_API_KEY: str | None = None

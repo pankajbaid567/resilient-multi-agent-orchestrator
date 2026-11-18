@@ -20,7 +20,6 @@ from models import StepDefinition, StepResult, TraceEntry
 from services.redis_service import get_redis_service
 
 logger = logging.getLogger(__name__)
-settings = get_settings()
 
 CompiledGraph = Any
 START_NODE = "__start__"
@@ -32,6 +31,7 @@ NODE_RETRY = "prepare_retry_node"
 NODE_REFLECTOR = "reflector_node"
 NODE_PARALLEL_EXECUTOR = "parallel_executor_node"
 NODE_FINALIZER = "finalizer_node"
+NODE_BUDGET = "budget_stop_node"
 
 STEP_STATUS_VALUES = {
     "pending",
@@ -50,20 +50,41 @@ except ImportError:
     _reflector_node = None
 
 
+def budget_exceeded(state: AgentState) -> str | None:
+    """Return a reason when the task has used its token budget or passed its deadline."""
+    token_budget = _safe_int(getattr(get_settings(), "TASK_TOKEN_BUDGET", 0), default=0)
+    if token_budget > 0 and _safe_int(state.get("llm_tokens_used"), default=0) >= token_budget:
+        return f"token budget reached ({state.get('llm_tokens_used')} >= {token_budget})"
+
+    deadline = _safe_int(getattr(get_settings(), "TASK_DEADLINE_SECONDS", 0), default=0)
+    started_at = state.get("started_at")
+    if deadline > 0 and started_at:
+        try:
+            started = datetime.fromisoformat(str(started_at))
+        except ValueError:
+            return None
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        if elapsed >= deadline:
+            return f"deadline reached ({int(elapsed)}s >= {deadline}s)"
+    return None
+
+
 def route_after_validation(state: AgentState) -> str:
-    """Determine next action based on validation verdict."""
+    """Determine next action based on validation verdict, retry limits and the task budget."""
     try:
         if state.get("status") == "failed":
             return "finalizer"
 
-        if not state["steps"]:
+        if not state["steps"] or not state["step_results"]:
             return "finalizer"
 
         if state["current_step_index"] >= len(state["steps"]):
             return "finalizer"
 
-        if not state["step_results"]:
-            return "finalizer"
+        if budget_exceeded(state):
+            return "budget"
 
         latest_result = state["step_results"][-1]
         current_step = state["steps"][state["current_step_index"]]
@@ -73,25 +94,44 @@ def route_after_validation(state: AgentState) -> str:
                 return "finalizer"
             return "next_step"
 
-        elif latest_result.validation == "retry":
-            step_id = current_step.step_id
-            retries = state["retry_counts"].get(step_id, 0)
-            if retries >= 3:
+        if latest_result.validation == "retry":
+            max_retries = max(0, _safe_int(getattr(get_settings(), "MAX_RETRIES", 3), default=3))
+            if state["retry_counts"].get(current_step.step_id, 0) >= max_retries:
                 return "reflect"
             return "retry"
 
-        elif latest_result.validation == "reflect":
-            step_id = current_step.step_id
-            reflections = state["reflection_counts"].get(step_id, 0)
-            if reflections >= 2:
-                return "finalizer"
-            return "reflect"
-
-        return "next_step" if state["current_step_index"] < len(state["steps"]) - 1 else "finalizer"
+        # "reflect": the reflector owns the limits (per-step SKIP, global ABORT), so a
+        # persistent failure on one step no longer ends the whole task silently.
+        return "reflect"
     except Exception as exc:  # pragma: no cover - defensive routing fallback
         logger.exception("route_after_validation_failed: %s", exc)
         _mark_node_exception(state, "route_after_validation", exc)
         return "finalizer"
+
+
+def route_after_reflection(state: AgentState) -> str:
+    """After reflection, stop if the task was aborted or every step has been handled."""
+    if state.get("status") == "failed":
+        return "finalizer"
+    if state["current_step_index"] >= len(state["steps"]):
+        return "finalizer"
+    if budget_exceeded(state):
+        return "budget"
+    return "executor"
+
+
+async def budget_stop_node(state: AgentState) -> AgentState:
+    """Record why the run stopped early; the finalizer then reports partial results."""
+    reason = budget_exceeded(state) or "budget exceeded"
+    timestamp = datetime.now(timezone.utc).isoformat()
+    state["error_log"].append(
+        {"timestamp": timestamp, "step_id": None, "error_type": "BUDGET_EXCEEDED", "error_message": reason}
+    )
+    state["execution_trace"].append(
+        TraceEntry(timestamp=timestamp, event_type="budget_exceeded", details={"reason": reason}).model_dump()
+    )
+    await _publish_event(task_id=state["task_id"], event_type="budget_exceeded", data={"reason": reason})
+    return state
 
 
 async def advance_step_node(state: AgentState) -> AgentState:
@@ -232,7 +272,7 @@ async def parallel_executor_node(state: AgentState) -> AgentState:
         state["execution_dag"] = dag.to_dict()
         state["execution_levels"] = levels
 
-        max_concurrent = max(1, _safe_int(getattr(settings, "MAX_CONCURRENT_STEPS", 5), default=5))
+        max_concurrent = max(1, _safe_int(getattr(get_settings(), "MAX_CONCURRENT_STEPS", 5), default=5))
         executor = ParallelExecutor(max_concurrent=max_concurrent)
         updated_state = await executor.execute_dag(dag=dag, state=state)
 
@@ -305,7 +345,7 @@ def build_graph(start_node: str = NODE_PLANNER) -> CompiledGraph:
     """Build and compile the LangGraph state machine."""
     graph = StateGraph(AgentState)
 
-    if bool(getattr(settings, "PARALLEL_MODE", False)):
+    if bool(getattr(get_settings(), "PARALLEL_MODE", False)):
         if start_node not in {
             NODE_PLANNER,
             NODE_PARALLEL_EXECUTOR,
@@ -347,6 +387,7 @@ def build_graph(start_node: str = NODE_PLANNER) -> CompiledGraph:
     graph.add_node(NODE_RETRY, _safe_node(NODE_RETRY, prepare_retry_node))
     graph.add_node(NODE_REFLECTOR, _safe_node(NODE_REFLECTOR, with_checkpoint(_reflector_entry)))
     graph.add_node(NODE_FINALIZER, _safe_node(NODE_FINALIZER, with_checkpoint(finalizer_node)))
+    graph.add_node(NODE_BUDGET, _safe_node(NODE_BUDGET, budget_stop_node))
 
     graph.add_edge(START_NODE, start_node)
     graph.add_edge(NODE_PLANNER, NODE_EXECUTOR)
@@ -359,11 +400,17 @@ def build_graph(start_node: str = NODE_PLANNER) -> CompiledGraph:
             "finalizer": NODE_FINALIZER,
             "retry": NODE_RETRY,
             "reflect": NODE_REFLECTOR,
+            "budget": NODE_BUDGET,
         },
     )
     graph.add_edge(NODE_ADVANCE, NODE_EXECUTOR)
     graph.add_edge(NODE_RETRY, NODE_EXECUTOR)
-    graph.add_edge(NODE_REFLECTOR, NODE_EXECUTOR)
+    graph.add_conditional_edges(
+        NODE_REFLECTOR,
+        route_after_reflection,
+        {"executor": NODE_EXECUTOR, "finalizer": NODE_FINALIZER, "budget": NODE_BUDGET},
+    )
+    graph.add_edge(NODE_BUDGET, NODE_FINALIZER)
     graph.add_edge(NODE_FINALIZER, END)
 
     return graph.compile()
@@ -372,11 +419,11 @@ def build_graph(start_node: str = NODE_PLANNER) -> CompiledGraph:
 def _graph_run_config() -> dict[str, int]:
     """Return safe graph runtime config with recursion limit sized for this workflow."""
 
-    explicit_limit = settings.graph_recursion_limit
+    explicit_limit = get_settings().graph_recursion_limit
     if explicit_limit > 0:
         return {"recursion_limit": explicit_limit}
 
-    max_steps = max(_safe_int(getattr(settings, "MAX_STEPS", 15), default=15), 1)
+    max_steps = max(_safe_int(getattr(get_settings(), "MAX_STEPS", 15), default=15), 1)
     # Each logical step can span several graph node transitions.
     derived_limit = max_steps * 8
     return {"recursion_limit": max(derived_limit, 50)}
@@ -422,7 +469,7 @@ async def resume_agent(task_id: str) -> AgentState:
 
     await _ensure_task_started_event(state)
 
-    if bool(getattr(settings, "PARALLEL_MODE", False)):
+    if bool(getattr(get_settings(), "PARALLEL_MODE", False)):
         if status in {"executing", "running", "validating", "reflecting"}:
             start_node = NODE_PARALLEL_EXECUTOR
         else:
@@ -635,6 +682,7 @@ def _hydrate_state_from_checkpoint(raw_state: dict[str, Any]) -> AgentState:
         for key, value in dict(raw_state.get("reflection_counts") or {}).items()
     }
     hydrated["error_log"] = list(raw_state.get("error_log") or [])
+    hydrated["validation_log"] = list(raw_state.get("validation_log") or [])
     hydrated["context_memory"] = [str(item) for item in list(raw_state.get("context_memory") or [])]
     hydrated["llm_tokens_used"] = _safe_int(raw_state.get("llm_tokens_used"), default=0)
     hydrated["status"] = str(raw_state.get("status") or "executing")

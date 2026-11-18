@@ -101,6 +101,23 @@ class CircuitBreaker:
                     len(self.calls),
                 )
 
+    async def release_probe(self) -> None:
+        """Free the half-open probe slot when the probe call ended without a verdict (cancelled)."""
+        async with self._lock:
+            self._half_open_probe_in_flight = False
+
+    async def reset(self) -> None:
+        """Forget all recorded calls and close the circuit."""
+        async with self._lock:
+            self.reset_nowait()
+
+    def reset_nowait(self) -> None:
+        """Synchronous reset; safe on the event loop thread because it never awaits."""
+        self.state = "closed"
+        self.calls = []
+        self.opened_at = None
+        self._half_open_probe_in_flight = False
+
     async def get_state(self) -> dict:
         """Return current state for debugging/UI display."""
         async with self._lock:
@@ -180,6 +197,23 @@ class CircuitBreakerManager:
         """Record a failed provider call."""
         breaker = await self.get_breaker(provider)
         await breaker.record_failure()
+
+    async def release_probe(self, provider: str) -> None:
+        """Free a provider's half-open probe slot after a cancelled call."""
+        breaker = await self.get_breaker(provider)
+        await breaker.release_probe()
+
+    async def reset_all(self) -> None:
+        """Close every circuit (used when chaos mode is switched off)."""
+        async with self._lock:
+            breakers = list(self.breakers.values())
+        for breaker in breakers:
+            await breaker.reset()
+
+    def reset_all_nowait(self) -> None:
+        """Synchronous variant of reset_all for non-async callers on the event loop thread."""
+        for breaker in list(self.breakers.values()):
+            breaker.reset_nowait()
 
     async def get_all_states(self) -> Dict[str, dict]:
         """Return all circuit breaker states (for UI/API)."""

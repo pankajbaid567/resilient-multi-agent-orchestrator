@@ -305,7 +305,11 @@ export default function App() {
       stepName: modalStep.name,
     });
 
-    const allErrors = Array.isArray(task?.error_log) ? task.error_log : [];
+    // Validator verdicts moved to validation_log; non-passing ones still belong in the step's issue list.
+    const validationIssues = (Array.isArray(task?.validation_log) ? task.validation_log : []).filter(
+      (item) => item && String(item.validator_verdict || "").toLowerCase() !== "pass",
+    );
+    const allErrors = [...(Array.isArray(task?.error_log) ? task.error_log : []), ...validationIssues];
     const stepErrors = allErrors.filter((item) => {
       if (!item || typeof item !== "object") {
         return false;
@@ -325,7 +329,7 @@ export default function App() {
     setSelectedStepTrace(stepTrace);
     setSelectedStepErrors(stepErrors);
     setIsStepModalOpen(true);
-  }, [resultByStepId, steps, task?.error_log, trace]);
+  }, [resultByStepId, steps, task?.error_log, task?.validation_log, trace]);
 
   const handleTaskSubmit = useCallback(async (input) => {
     setActiveView("execute");

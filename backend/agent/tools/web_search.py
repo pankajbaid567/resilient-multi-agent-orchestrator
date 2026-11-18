@@ -69,8 +69,8 @@ async def web_search(
     query: str,
     max_results: int = 5,
     search_depth: str = "basic",
-    include_domains: List[str] = [],
-    exclude_domains: List[str] = [],
+    include_domains: List[str] | None = None,
+    exclude_domains: List[str] | None = None,
 ) -> ToolResult:
     """
     Search the web using Tavily API.

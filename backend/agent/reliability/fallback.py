@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 import logging
-from typing import Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 from config import get_settings
-from services.llm_service import LLMResponse, LLMResponseError, call_llm
+from services.llm_service import LLMResponse, call_llm
 
 from .chaos import get_chaos_middleware
 from .retry import NON_RETRYABLE_EXCEPTIONS, RETRYABLE_EXCEPTIONS, retry_with_backoff
+
+if TYPE_CHECKING:
+    from .circuit_breaker import CircuitBreakerManager
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +88,6 @@ async def call_with_fallback(
         provider_key = f"{provider}/{model}"
         context = _log_context(task_id=task_id, step_id=step_id)
         chaos_mode_enabled = bool(get_settings().CHAOS_MODE)
-        chaos_injection: str | None = None
 
         if not provider or not model:
             invalid_reason = f"Invalid fallback entry at index {index}: {entry}"
@@ -104,34 +107,37 @@ async def call_with_fallback(
                 await _log_fallback_transition(chain=chain, index=index, reason=reason)
                 continue
 
-        try:
+        async def _attempt(provider: str = provider, model: str = model) -> LLMResponse:
+            # Chaos is injected inside the retried call, so the retry layer sees an injected
+            # failure exactly as it would see a real one.
+            injection = None
             if chaos_mode_enabled:
                 chaos = get_chaos_middleware()
                 chaos.enabled = True
-                chaos_context = f"provider={provider}, step={step_id or 'unknown'}"
-                chaos_injection = await chaos.maybe_inject(chaos_context)
+                injection = await chaos.maybe_inject(f"provider={provider}, step={step_id or 'unknown'}")
+            response = await call_llm(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                model=model,
+                provider=provider,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                json_mode=json_mode,
+                timeout=timeout,
+            )
+            if injection == "CORRUPT":
+                response.text = response.text[: len(response.text) // 2]
+            return response
 
+        try:
             response = await retry_with_backoff(
-                func=lambda provider=provider, model=model: call_llm(
-                    prompt=prompt,
-                    system_prompt=system_prompt,
-                    model=model,
-                    provider=provider,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    json_mode=json_mode,
-                    timeout=timeout,
-                ),
+                func=_attempt,
                 max_retries=1,
                 retryable_exceptions=RETRYABLE_EXCEPTIONS,
-                non_retryable_exceptions=_non_retryable_for_fallback(),
+                non_retryable_exceptions=NON_RETRYABLE_EXCEPTIONS,
                 task_id=task_id,
                 step_id=step_id,
             )
-
-            if chaos_injection == "CORRUPT":
-                half = len(response.text) // 2
-                response.text = response.text[:half]
 
             if circuit_breaker is not None:
                 await _circuit_record_success(circuit_breaker, provider_key)
@@ -142,13 +148,18 @@ async def call_with_fallback(
                 logger.info("%sPrimary provider succeeded with %s", context, provider_key)
 
             return response
+        except asyncio.CancelledError:
+            # A cancelled call is not a provider failure, but it may hold the half-open probe.
+            if circuit_breaker is not None and hasattr(circuit_breaker, "release_probe"):
+                await circuit_breaker.release_probe(provider_key)
+            raise
         except Exception as exc:
             if circuit_breaker is not None:
                 await _circuit_record_failure(circuit_breaker, provider_key)
 
             reason = f"{exc.__class__.__name__}: {exc}"
             error_entry: dict[str, Any] = {"provider": provider_key, "error": reason}
-            chaos_tag = _extract_chaos_tag(exc)
+            chaos_tag = _extract_chaos_tag(exc) or _extract_chaos_tag(getattr(exc, "last_error", None))
             if chaos_tag:
                 error_entry["chaos_injected"] = True
                 error_entry["injection_type"] = chaos_tag
@@ -160,11 +171,6 @@ async def call_with_fallback(
 
     logger.error("%sAll providers exhausted. Escalating.", _log_context(task_id=task_id, step_id=step_id))
     raise AllProvidersFailedError(errors=errors)
-
-
-def _non_retryable_for_fallback() -> tuple:
-    """Return non-retryable exception types while preserving LLM empty-response retries."""
-    return tuple(exc for exc in NON_RETRYABLE_EXCEPTIONS if exc is not LLMResponseError)
 
 
 async def _log_fallback_transition(chain: List[dict], index: int, reason: str) -> None:
@@ -232,9 +238,9 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
-def _extract_chaos_tag(error: Exception) -> str | None:
+def _extract_chaos_tag(error: Exception | None) -> str | None:
     """Extract chaos injection metadata from raised exception objects."""
-    if not bool(getattr(error, "chaos_injected", False)):
+    if error is None or not bool(getattr(error, "chaos_injected", False)):
         return None
 
     injection_type = str(getattr(error, "injection_type", "")).strip().lower()

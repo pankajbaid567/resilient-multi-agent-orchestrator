@@ -42,14 +42,6 @@ async def append_trace_event(event: Any) -> None:
 	await _append_trace_event(event)
 
 
-def __getattr__(name: str) -> Any:
-	"""Provide lazy access to optional heavy services."""
-	if name == "VectorService":
-		from .vector_service import VectorService
-
-		return VectorService
-	raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
 __all__ = [
 	"RedisService",
 	"append_trace_event",
@@ -57,5 +49,4 @@ __all__ = [
 	"close_redis_client",
 	"get_redis_client",
 	"get_redis_service",
-	"VectorService",
 ]

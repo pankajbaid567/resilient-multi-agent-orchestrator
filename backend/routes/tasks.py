@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
-from datetime import datetime, timezone
 import logging
 from typing import Any
 from uuid import uuid4
@@ -12,10 +10,10 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from agent.graph import resume_agent
 from agent.nodes.planner import planner_node
 from agent.reliability.chaos import get_chaos_middleware, set_chaos_mode as set_chaos_runtime_mode
 from agent.state import create_initial_state
+from routes.execute import start_background_execution
 from security import require_admin
 from services.redis_service import get_redis_service
 
@@ -138,10 +136,10 @@ async def resume_task(task_id: str):
             return _error_response(status_code=404, message=f"Task not found: {task_id}")
 
         from_step = _safe_int(state.get("current_step_index"), default=0)
-        asyncio.create_task(_resume_task_background(task_id))
+        started = start_background_execution(task_id)
         return ResumeTaskResponse(
             success=True,
-            data=ResumeTaskData(status="resumed", from_step=max(0, from_step)),
+            data=ResumeTaskData(status="resumed" if started else "already_running", from_step=max(0, from_step)),
             error=None,
         )
     except Exception as exc:
@@ -167,44 +165,6 @@ async def get_chaos_mode():
         chaos_mode=bool(middleware.enabled),
         stats={str(key): int(value) for key, value in middleware.get_stats().items()},
     )
-
-
-async def _resume_task_background(task_id: str) -> None:
-    """Background task runner that resumes execution and emits terminal events."""
-    redis = get_redis_service()
-
-    try:
-        final_state = await resume_agent(task_id)
-        await redis.save_checkpoint(task_id, final_state)
-
-        final_status = str(final_state.get("status") or "failed").lower()
-        event_type = "task_completed" if final_status == "completed" else "task_failed"
-        await redis.publish_event(
-            task_id,
-            {
-                "event_type": event_type,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "task_id": task_id,
-                "data": {
-                    "status": final_state.get("status"),
-                    "current_step_index": final_state.get("current_step_index"),
-                },
-            },
-        )
-    except Exception as exc:  # pragma: no cover - background task safety
-        logger.exception("resume_task_background_failed task_id=%s error=%s", task_id, exc)
-        try:
-            await redis.publish_event(
-                task_id,
-                {
-                    "event_type": "task_failed",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "task_id": task_id,
-                    "data": {"status": "failed", "error": str(exc)},
-                },
-            )
-        except Exception:
-            pass
 
 
 def _serialize_steps(steps: list[Any]) -> list[dict[str, Any]]:

@@ -18,7 +18,6 @@ class ChaosMiddleware:
 
     def __init__(self, enabled: bool = False):
         self.enabled = enabled
-        self.force_next_rate_limit = bool(enabled)
         self.injection_stats = {
             "latency": 0,
             "empty": 0,
@@ -41,12 +40,6 @@ class ChaosMiddleware:
         """
         if not self.enabled:
             return None
-
-        if self.force_next_rate_limit:
-            self.force_next_rate_limit = False
-            self.injection_stats["rate_limit"] += 1
-            logger.warning("CHAOS: Injected forced rate_limit at %s", context or "unknown")
-            raise _tag_chaos_exception(LLMRateLimitError("Chaos: forced rate limit"), "rate_limit")
 
         roll = random.random()
         context_text = context or "unknown"
@@ -105,7 +98,11 @@ def set_chaos_mode(enabled: bool) -> ChaosMiddleware:
 
     middleware = get_chaos_middleware()
     middleware.enabled = bool(enabled)
-    middleware.force_next_rate_limit = bool(enabled)
+    if not enabled:
+        # Injected failures must not keep real providers' circuits open after chaos ends.
+        from .circuit_breaker import get_circuit_breaker_manager
+
+        get_circuit_breaker_manager().reset_all_nowait()
     return middleware
 
 

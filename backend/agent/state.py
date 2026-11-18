@@ -20,6 +20,7 @@ class AgentState(TypedDict):
     retry_counts: Dict[str, int]
     reflection_counts: Dict[str, int]
     error_log: List[dict]
+    validation_log: List[dict]
     context_memory: List[str]
     llm_tokens_used: int
     status: str
@@ -46,6 +47,7 @@ def create_initial_state(task_id: str, user_input: str) -> AgentState:
         retry_counts={},
         reflection_counts={},
         error_log=[],
+        validation_log=[],
         context_memory=[],
         llm_tokens_used=0,
         status="planning",

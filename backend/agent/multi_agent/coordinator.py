@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from agent.reliability.circuit_breaker import get_circuit_breaker_manager
 from agent.reliability.fallback import FALLBACK_CHAIN, call_with_fallback
@@ -13,7 +13,7 @@ from config import get_settings
 from models import StepDefinition, StepResult
 from services.llm_service import call_llm
 
-from .agents import AGENT_REGISTRY, ANALYSIS_AGENT, SpecializedAgent
+from .agents import AGENT_REGISTRY, SpecializedAgent
 from .router import AgentRouter
 
 logger = logging.getLogger(__name__)
@@ -35,7 +35,9 @@ class AgentCoordinator:
         """Route step, execute via specialized agent profile, and track assignment/metrics."""
         agent = await self.router.route_step(step)
         context = self._build_context(state=state, current_step_id=step.step_id)
-        system_prompt, user_prompt = self.build_agent_prompt(agent=agent, step=step, context=context)
+        system_prompt, user_prompt = self.build_agent_prompt(
+            agent=agent, step=step, context=context, original_input=str(state.get("original_input") or "")
+        )
 
         previous_agent = self._resolve_previous_agent(state)
         handoff_summary = ""
@@ -84,7 +86,7 @@ class AgentCoordinator:
             )
 
             self._record_assignment(
-                step_id=step.step_id,
+                step_id=self._history_key(state, step.step_id),
                 agent=agent,
                 action="executed",
                 result_status=result.status,
@@ -119,7 +121,7 @@ class AgentCoordinator:
                 agent_role=agent.role,
             )
             self._record_assignment(
-                step_id=step.step_id,
+                step_id=self._history_key(state, step.step_id),
                 agent=agent,
                 action="failed",
                 result_status=failure.status,
@@ -135,6 +137,7 @@ class AgentCoordinator:
         agent: SpecializedAgent,
         step: StepDefinition,
         context: str,
+        original_input: str = "",
     ) -> Tuple[str, str]:
         """Build system prompt and user prompt for the agent."""
         system_prompt = (
@@ -145,7 +148,7 @@ class AgentCoordinator:
         )
 
         user_prompt = (
-            f"Overall task:\n{step.description}\n\n"
+            f"Overall task:\n{original_input or step.name}\n\n"
             f"Step id: {step.step_id}\n"
             f"Step name: {step.name}\n"
             f"Step instructions:\n{step.description}\n\n"
@@ -199,7 +202,7 @@ class AgentCoordinator:
             total_quality = float(stats.get("total_quality", 0.0))
             quality_samples = int(stats.get("quality_samples", 0))
             avg_quality = (total_quality / quality_samples) if quality_samples > 0 else 0.0
-            roles_executed = sorted(list(stats.get("roles_executed", set())))
+            roles_executed = sorted(stats.get("roles_executed", set()))
 
             contributions[agent_name] = {
                 "steps_handled": steps_handled,
@@ -241,6 +244,9 @@ class AgentCoordinator:
             "handoff_summary": handoff_summary,
         }
         self.agent_history.setdefault(step_id, []).append(entry)
+        # Bound the process-wide history so a long-running server does not grow without limit.
+        while len(self.agent_history) > 1_000:
+            self.agent_history.pop(next(iter(self.agent_history)))
 
     def _update_stats(self, agent: SpecializedAgent, tokens_used: int, quality_score: Optional[float]) -> None:
         """Update aggregate per-agent counters."""
@@ -263,17 +269,38 @@ class AgentCoordinator:
             stats["quality_samples"] += 1
 
     def _apply_state_metrics(self, state: AgentState, step_id: str) -> None:
-        """Expose assignment and contribution aggregates in AgentState."""
-        if "agent_assignments" not in state:
-            state["agent_assignments"] = {}
-        if "agent_contributions" not in state:
-            state["agent_contributions"] = {}
+        """Expose this task's assignment and contribution aggregates in AgentState.
 
-        latest_assignment = self.agent_history.get(step_id, [])
+        Computed from the task's own state only. The coordinator is a process-wide
+        singleton, so its in-memory history must never leak one task's numbers into another.
+        """
+        state.setdefault("agent_assignments", {})
+        latest_assignment = self.agent_history.get(self._history_key(state, step_id), [])
         if latest_assignment:
             state["agent_assignments"][step_id] = str(latest_assignment[-1].get("agent_name", ""))
+        state["agent_contributions"] = self.contributions_from_state(state)
 
-        state["agent_contributions"] = self.get_agent_contributions()
+    @staticmethod
+    def contributions_from_state(state: AgentState) -> Dict[str, dict]:
+        """Aggregate per-agent steps and tokens from one task's step results."""
+        contributions: Dict[str, dict] = {}
+        for result in state.get("step_results", []):
+            name = getattr(result, "agent_name", None)
+            if not name:
+                continue
+            entry = contributions.setdefault(
+                name, {"steps_handled": 0, "avg_quality": 0.0, "total_tokens": 0, "roles_executed": []}
+            )
+            entry["steps_handled"] += 1
+            entry["total_tokens"] += max(0, int(getattr(result, "tokens_used", 0) or 0))
+            role = getattr(result, "agent_role", None)
+            if role and role not in entry["roles_executed"]:
+                entry["roles_executed"].append(role)
+        return contributions
+
+    @staticmethod
+    def _history_key(state: AgentState, step_id: str) -> str:
+        return f"{state.get('task_id', '')}:{step_id}"
 
     def _build_context(self, state: AgentState, current_step_id: str) -> str:
         """Create compact execution context for routed agents."""

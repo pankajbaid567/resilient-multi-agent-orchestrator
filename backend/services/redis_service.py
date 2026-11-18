@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from collections.abc import AsyncGenerator
 from datetime import datetime
 from typing import Any
@@ -17,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 STATE_TTL_SECONDS = 86400
 CIRCUIT_TTL_SECONDS = 300
+RECONNECT_INTERVAL_SECONDS = 30.0
+MAX_QUEUED_EVENTS = 500
 ALLOWED_STEP_STATUSES = {
     "pending",
     "running",
@@ -44,6 +47,9 @@ class RedisService:
         self._connected = False
         self._connect_lock = asyncio.Lock()
         self._fallback_warning_logged = False
+        # After a failed connect, skip reconnect attempts until this monotonic time, so a
+        # missing Redis costs one fast check per interval instead of seconds per operation.
+        self._next_connect_attempt = 0.0
 
         # In-memory fallback stores.
         self._state_store: dict[str, str] = {}
@@ -213,10 +219,12 @@ class RedisService:
             except (RedisConnectionError, RedisError) as exc:
                 self._mark_fallback(exc)
 
-        queue = self._event_queues.setdefault(task_id, asyncio.Queue())
+        queue = self._event_queues.setdefault(task_id, asyncio.Queue(maxsize=MAX_QUEUED_EVENTS))
         normalized = self._deserialize(payload)
         if isinstance(normalized, dict):
-            await queue.put(normalized)
+            if queue.full():
+                queue.get_nowait()  # drop the oldest event rather than grow without bound
+            queue.put_nowait(normalized)
 
     async def subscribe_events(self, task_id: str) -> AsyncGenerator[dict[str, Any], None]:
         """Subscribe to task events. Yields parsed JSON events.
@@ -252,10 +260,15 @@ class RedisService:
                 except (RedisConnectionError, RedisError):
                     pass
 
-        queue = self._event_queues.setdefault(task_id, asyncio.Queue())
-        while True:
-            event = await queue.get()
-            yield event
+        queue = self._event_queues.setdefault(task_id, asyncio.Queue(maxsize=MAX_QUEUED_EVENTS))
+        try:
+            while True:
+                event = await queue.get()
+                yield event
+                if str(event.get("event_type") or "") in {"task_completed", "task_failed"}:
+                    return
+        finally:
+            self._event_queues.pop(task_id, None)
 
     # --- Circuit Breaker State ---
 
@@ -306,10 +319,17 @@ class RedisService:
 
     async def _get_client(self) -> Redis | None:
         """Get a ready Redis client, creating/connecting it when needed."""
-        if self._client is None:
-            connected = await self.connect()
-            return self._client if connected else None
+        if self._client is not None:
+            return self._client
 
+        now = time.monotonic()
+        if now < self._next_connect_attempt:
+            return None
+
+        connected = await self.connect(retries=1, delay=0.0)
+        if not connected:
+            self._next_connect_attempt = now + RECONNECT_INTERVAL_SECONDS
+            return None
         return self._client
 
     async def _safe_close_client(self) -> None:

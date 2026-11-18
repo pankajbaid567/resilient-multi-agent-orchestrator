@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import json
 import logging
 import re
 from time import perf_counter
@@ -13,7 +12,7 @@ from agent.multi_agent.coordinator import get_agent_coordinator
 from agent.reliability.circuit_breaker import get_circuit_breaker_manager
 from agent.reliability.fallback import AllProvidersFailedError, FALLBACK_CHAIN, call_with_fallback
 from agent.state import AgentState
-from agent.tools import call_api, execute_python_code, search_web
+from agent.tools.dispatch import ToolOutcome, run_step_tool
 from config import get_settings
 from models import StepDefinition, StepResult, TraceEntry
 from services.llm_service import LLMResponse, LLMResponseError
@@ -24,7 +23,8 @@ logger = logging.getLogger(__name__)
 SYSTEM_PROMPT_TEMPLATE = (
     "You are executing step {step_number} of {total_steps} in a multi-step task. "
     "Use the provided context from previous steps. Be thorough, accurate, and specific. "
-    "Do NOT mention that you are an AI or that you cannot access real data - work with what you have."
+    "If information you need is missing, or a tool reports a failure, say so explicitly and name what is unknown. "
+    "Never invent numbers, names, dates or sources."
 )
 
 USER_PROMPT_TEMPLATE = """Overall Task: {original_input}
@@ -113,58 +113,18 @@ async def executor_node(state: AgentState) -> AgentState:
             )
             return state
 
-        if step.tool_needed == "web_search":
-            tool_used = "web_search"
-            tool_result = _safe_web_search(step.description)
-            if tool_result.get("success"):
-                user_prompt = f"{user_prompt}\n\nSearch Results: {json.dumps(tool_result, ensure_ascii=True)}"
-            else:
-                logger.warning("executor_tool_failed tool=web_search step_id=%s error=%s", step.step_id, tool_result)
-                tool_result = None
-                tool_used = None
-
-        elif step.tool_needed == "api_call":
-            tool_used = "api_call"
-            tool_result = _safe_api_call(step.description)
-            if tool_result.get("success"):
-                user_prompt = f"{user_prompt}\n\nAPI Response: {json.dumps(tool_result, ensure_ascii=True)}"
-            else:
-                logger.warning("executor_tool_failed tool=api_call step_id=%s error=%s", step.step_id, tool_result)
-                tool_result = None
-                tool_used = None
-
-        elif step.tool_needed == "code_exec":
-            tool_used = "code_exec"
-            code_generation_result = await _safe_generate_code(
-                original_input=state["original_input"],
-                step_name=step.name,
-                step_description=step.description,
-                task_id=state["task_id"],
-                step_id=step.step_id,
-            )
-            if code_generation_result is None:
-                logger.warning("executor_tool_failed tool=code_exec step_id=%s reason=code_generation_failed", step.step_id)
-                tool_result = None
-                tool_used = None
-            else:
-                generated_code = _extract_python_code(code_generation_result.text)
-                execution_result = execute_python_code(generated_code)
-                if execution_result.get("success"):
-                    tool_result = {
-                        "generated_code": generated_code,
-                        "execution": execution_result,
-                        "generation_model": code_generation_result.model_used,
-                    }
-                    user_prompt = f"{user_prompt}\n\nCode Execution Output: {json.dumps(tool_result, ensure_ascii=True)}"
-                    state["llm_tokens_used"] += code_generation_result.tokens_used
-                else:
-                    logger.warning("executor_tool_failed tool=code_exec step_id=%s error=%s", step.step_id, execution_result)
-                    tool_result = None
-                    tool_used = None
+        tool_outcome = await run_step_tool(step, generate_code=_code_generator(state))
+        if tool_outcome.tool is not None:
+            tool_used = tool_outcome.tool
+            tool_result = _tool_result_payload(tool_outcome)
+            user_prompt = f"{user_prompt}\n\n{tool_outcome.prompt_block}"
+            state["llm_tokens_used"] += tool_outcome.tokens_used
+            if tool_outcome.failed:
+                _record_tool_failure(state=state, step=step, outcome=tool_outcome)
 
         if multi_agent_mode:
             coordinator = get_agent_coordinator()
-            enriched_step = _build_agent_step_for_execution(step=step, tool_result=tool_result)
+            enriched_step = _build_agent_step_for_execution(step=step, tool_block=tool_outcome.prompt_block)
             coordinator_result, assigned_agent = await coordinator.execute_step_with_agent(
                 step=enriched_step,
                 state=state,
@@ -387,34 +347,73 @@ def _build_context_block(state: AgentState, step_id: str) -> str:
         memory_block = "- No accumulated context memory yet."
 
     reflection_reason = _extract_reflection_reason(state=state, step_id=step_id)
+    feedback = _latest_validator_feedback(state=state, step_id=step_id)
+    notes: list[str] = []
     if reflection_reason:
-        reflection_block = f"- This step was modified by reflector. Reason: {reflection_reason}"
-    else:
-        reflection_block = "- No reflection-based modification noted for this step."
+        notes.append(f"- The reflector changed this step: {reflection_reason}")
+    if feedback:
+        notes.append(f"- Reviewer feedback on the previous attempt (fix this): {feedback}")
+    reflection_block = "\n".join(notes) if notes else "- No earlier attempt for this step."
 
     return (
         f"{formatted_prior_results}\n\n"
         f"Accumulated Context Memory:\n{memory_block}\n\n"
-        f"Reflection Notes:\n{reflection_block}"
+        f"Notes for this attempt:\n{reflection_block}"
     )
 
 
-def _build_agent_step_for_execution(step: StepDefinition, tool_result: dict[str, Any] | None) -> StepDefinition:
-    """Enrich step description with tool output context before multi-agent execution."""
-    if not tool_result:
+def _build_agent_step_for_execution(step: StepDefinition, tool_block: str | None) -> StepDefinition:
+    """Append the fenced tool output (or the tool-failure note) to the step for agent execution."""
+    if not tool_block:
         return step
+    return step.model_copy(update={"description": f"{step.description.strip()}\n\n{tool_block}"})
 
-    try:
-        serialized_tool_result = json.dumps(tool_result, ensure_ascii=True)
-    except Exception:
-        serialized_tool_result = str(tool_result)
 
-    enriched_description = (
-        f"{step.description.strip()}\n\n"
-        "Tool output context (use this as factual input when relevant):\n"
-        f"{serialized_tool_result[:4000]}"
+def _tool_result_payload(outcome: ToolOutcome) -> dict[str, Any]:
+    """Serializable record of a tool call for step results and traces."""
+    return {"ok": outcome.ok, "error": outcome.error, "payload": outcome.payload}
+
+
+def _record_tool_failure(state: AgentState, step: StepDefinition, outcome: ToolOutcome) -> None:
+    """Record a failed tool call so traces and metrics show it instead of hiding it."""
+    timestamp = datetime.now(timezone.utc).isoformat()
+    state["error_log"].append(
+        {
+            "timestamp": timestamp,
+            "step_id": step.step_id,
+            "error_type": "TOOL_FAILURE",
+            "tool": outcome.tool,
+            "error_message": outcome.error or "tool failed",
+        }
     )
-    return step.model_copy(update={"description": enriched_description})
+    state["execution_trace"].append(
+        TraceEntry(
+            timestamp=timestamp,
+            event_type="tool_failed",
+            step_id=step.step_id,
+            step_name=step.name,
+            details={"tool": outcome.tool},
+            error=outcome.error,
+        ).model_dump()
+    )
+
+
+def _code_generator(state: AgentState):
+    """Return an async callable that asks the model for Python code for a step."""
+
+    async def _generate(step: StepDefinition) -> tuple[str, int, str] | None:
+        response = await _safe_generate_code(
+            original_input=state["original_input"],
+            step_name=step.name,
+            step_description=step.description,
+            task_id=state["task_id"],
+            step_id=step.step_id,
+        )
+        if response is None:
+            return None
+        return _extract_python_code(response.text), response.tokens_used, response.model_used
+
+    return _generate
 
 
 async def _append_agent_assigned_trace(
@@ -468,58 +467,23 @@ def _is_model_fallback_used(actual_model: str, preferred_model: str) -> bool:
 
 
 def _extract_reflection_reason(state: AgentState, step_id: str) -> str | None:
-    """Extract reflection reason for the current step from memory/error logs."""
-    step_pattern = f"Reflection for step {step_id}:"
-    for note in reversed(state["context_memory"]):
-        if note.startswith(step_pattern):
-            return note.replace(step_pattern, "", 1).strip() or "No reason provided"
-
-    for error in reversed(state["error_log"]):
-        if str(error.get("step_id") or "") == step_id and "reason" in error:
-            return str(error["reason"])
-
+    """Return the reflector's note for this step, if it modified it."""
+    for prefix in (f"Reflection for step {step_id}:", f"Reflection modified {step_id}:"):
+        for note in reversed(state["context_memory"]):
+            if note.startswith(prefix):
+                return note.replace(prefix, "", 1).strip() or "No reason provided"
     return None
 
 
-def _safe_web_search(description: str) -> dict[str, Any]:
-    """Run web search tool safely and normalize failures into tool payload shape."""
-    try:
-        return search_web(query=description, max_results=5)
-    except Exception as exc:  # pragma: no cover - defensive tool guard
-        return {
-            "success": False,
-            "data": {},
-            "error_message": str(exc),
-            "tool_name": "web_search",
-        }
-
-
-def _safe_api_call(description: str) -> dict[str, Any]:
-    """Run API caller tool with URL extraction from step description."""
-    extracted_url = _extract_url(description)
-    if extracted_url is None:
-        return {
-            "success": False,
-            "data": {},
-            "error_message": "No URL found in step description for api_call tool.",
-            "tool_name": "api_caller",
-        }
-
-    try:
-        return call_api(method="GET", url=extracted_url)
-    except Exception as exc:  # pragma: no cover - defensive tool guard
-        return {
-            "success": False,
-            "data": {},
-            "error_message": str(exc),
-            "tool_name": "api_caller",
-        }
-
-
-def _extract_url(text: str) -> str | None:
-    """Extract the first URL from free-form step text."""
-    match = re.search(r"https?://[^\s\]\)\"']+", text)
-    return match.group(0) if match else None
+def _latest_validator_feedback(state: AgentState, step_id: str) -> str | None:
+    """Return the most recent non-passing validator reason for this step."""
+    for entry in reversed(state.get("validation_log") or []):
+        if str(entry.get("step_id") or "") != step_id:
+            continue
+        if entry.get("verdict") == "pass" or entry.get("validator_verdict") == "pass":
+            return None
+        return str(entry.get("reason") or "") or None
+    return None
 
 
 async def _safe_generate_code(
@@ -717,7 +681,7 @@ async def _publish_retry_event(task_id: str, step_id: str, attempt: int, reason:
             "step_id": step_id,
             "attempt": attempt,
             "reason": reason,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         },
     )
 
@@ -736,7 +700,7 @@ async def _publish_fallback_event(
             "step_id": step_id,
             "from_provider": from_provider,
             "to_provider": to_provider,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         },
     )
 

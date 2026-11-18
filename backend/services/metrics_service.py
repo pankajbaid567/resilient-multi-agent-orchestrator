@@ -79,7 +79,9 @@ class MetricsService:
         tools_used = self._collect_tools_used(step_results=step_results, trace=trace)
         agents_used = self._collect_agents_used(step_results=step_results, trace=trace)
 
-        quality_scores = self._collect_quality_scores(error_log=error_log)
+        quality_scores = self._collect_quality_scores(
+            error_log=self._as_list(state_data.get("validation_log")) + error_log
+        )
         failure_types = self._collect_failure_types(error_log=error_log, step_results=step_results)
         reflection_strategies = self._collect_reflection_strategies(trace=trace)
 

@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 import logging
-from typing import Any
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
@@ -44,8 +43,10 @@ async def execute_task(task_id: str):
         if state is None:
             return _error_response(status_code=404, message=f"Task not found: {task_id}")
 
-        _start_background_execution(task_id)
-        return ExecuteResponse(success=True, data=ExecuteData(status="started"), error=None)
+        started = start_background_execution(task_id)
+        return ExecuteResponse(
+            success=True, data=ExecuteData(status="started" if started else "already_running"), error=None
+        )
     except Exception as exc:
         logger.exception("execute_task_failed task_id=%s error=%s", task_id, exc)
         return _error_response(status_code=500, message=str(exc))
@@ -141,14 +142,20 @@ async def task_events(ws: WebSocket, task_id: str) -> None:
             pass
 
 
-def _start_background_execution(task_id: str) -> None:
-    """Start a single background execution task per task_id."""
+def start_background_execution(task_id: str) -> bool:
+    """Start one background run per task_id; return False when a run is already active.
+
+    Both /execute and /resume go through here, so the same task can never run twice
+    concurrently in this process (two runs would overwrite each other's checkpoints).
+    The dict also keeps a strong reference so the task is not garbage-collected mid-run.
+    """
     existing = _running_tasks.get(task_id)
     if existing is not None and not existing.done():
-        return
+        return False
 
     task = asyncio.create_task(_run_execution(task_id))
     _running_tasks[task_id] = task
+    return True
 
 
 async def _run_execution(task_id: str) -> None:
@@ -188,13 +195,7 @@ async def _run_execution(task_id: str) -> None:
         except Exception:
             pass
     finally:
-        running = _running_tasks.get(task_id)
-        if running is not None and running.done():
-            _running_tasks.pop(task_id, None)
-        elif running is not None and running.cancelled():
-            _running_tasks.pop(task_id, None)
-        else:
-            _running_tasks.pop(task_id, None)
+        _running_tasks.pop(task_id, None)
 
 
 def _error_response(status_code: int, message: str) -> JSONResponse:

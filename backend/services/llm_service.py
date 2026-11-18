@@ -39,6 +39,14 @@ class LLMResponseError(LLMError):
     """Raised when the provider returns an empty or invalid response payload."""
 
 
+class LLMServerError(LLMError):
+    """Raised on a provider-side 5xx error (transient, worth retrying)."""
+
+
+class LLMRequestError(LLMError):
+    """Raised on a client error (400/401/403/404/422): retrying the same request cannot help."""
+
+
 @dataclass(slots=True)
 class LLMResponse:
     """Normalized response payload returned by the LLM service."""
@@ -48,6 +56,8 @@ class LLMResponse:
     latency_ms: int
     model_used: str
     provider: str
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 def get_openai_client() -> AsyncOpenAI:
@@ -117,6 +127,7 @@ async def call_llm(
             )
             text = _extract_openai_text(response)
             tokens_used = _extract_openai_tokens(response)
+            input_tokens, output_tokens = _usage_split(response, "prompt_tokens", "completion_tokens")
             model_used = str(getattr(response, "model", model) or model)
         else:
             response = await _call_anthropic(
@@ -130,6 +141,7 @@ async def call_llm(
             )
             text = _extract_anthropic_text(response)
             tokens_used = _extract_anthropic_tokens(response)
+            input_tokens, output_tokens = _usage_split(response, "input_tokens", "output_tokens")
             model_used = str(getattr(response, "model", model) or model)
 
         if not text.strip():
@@ -149,6 +161,8 @@ async def call_llm(
             latency_ms=latency_ms,
             model_used=model_used,
             provider=normalized_provider,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
         )
     except LLMError:
         latency_ms = int((perf_counter() - started) * 1000)
@@ -200,18 +214,20 @@ async def _call_openai(
     try:
         return await asyncio.wait_for(client.chat.completions.create(**request_kwargs), timeout=timeout)
     except Exception as exc:
-        # Some open-source models served via OpenAI-compatible endpoints do not
-        # support the ``response_format`` parameter.  When json_mode was requested
-        # and the call fails, retry without structured-output enforcement and
-        # instead append a JSON instruction to the system prompt.
-        if json_mode and "response_format" in request_kwargs:
+        # Some OpenAI-compatible endpoints reject ``response_format``. Only that rejection
+        # (a 400/422 from the provider) is worth one retry without it; timeouts, rate limits
+        # and server errors propagate so the retry layer can classify them.
+        if json_mode and "response_format" in request_kwargs and _extract_status_code(exc) in {400, 422}:
             logger.warning(
                 "json_mode_fallback model=%s error=%s — retrying without response_format",
                 model,
                 exc,
             )
             request_kwargs.pop("response_format", None)
-            request_kwargs["messages"][0]["content"] += "\nRespond ONLY with valid JSON."
+            request_kwargs["messages"] = [
+                {"role": "system", "content": f"{system_prompt}\nRespond ONLY with valid JSON."},
+                {"role": "user", "content": prompt},
+            ]
             return await asyncio.wait_for(
                 client.chat.completions.create(**request_kwargs), timeout=timeout
             )
@@ -314,6 +330,17 @@ def _extract_anthropic_tokens(response: Any) -> int:
     return int(input_tokens + output_tokens)
 
 
+def _usage_split(response: Any, input_field: str, output_field: str) -> tuple[int, int]:
+    """Return (input_tokens, output_tokens) as reported by the provider, or zeros."""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return 0, 0
+    try:
+        return int(getattr(usage, input_field, 0) or 0), int(getattr(usage, output_field, 0) or 0)
+    except (TypeError, ValueError):
+        return 0, 0
+
+
 def _map_provider_error(exc: Exception, provider: str, model: str) -> LLMError:
     """Map provider and transport exceptions to typed LLM service errors."""
     if isinstance(exc, asyncio.TimeoutError) or exc.__class__.__name__ == "APITimeoutError":
@@ -322,6 +349,12 @@ def _map_provider_error(exc: Exception, provider: str, model: str) -> LLMError:
     status_code = _extract_status_code(exc)
     if status_code == 429 or exc.__class__.__name__ == "RateLimitError":
         return LLMRateLimitError(f"LLM rate limit hit for provider={provider} model={model}")
+
+    if status_code is not None and status_code >= 500:
+        return LLMServerError(f"LLM provider error {status_code} for provider={provider} model={model}")
+
+    if status_code is not None and 400 <= status_code < 500:
+        return LLMRequestError(f"LLM request rejected ({status_code}) for provider={provider} model={model}: {exc}")
 
     if isinstance(exc, OSError) or exc.__class__.__name__ in {
         "APIConnectionError",

@@ -15,13 +15,13 @@ from agent.nodes.executor import (
     USER_PROMPT_TEMPLATE,
     _build_agent_step_for_execution,
     _call_llm_with_reliability,
-    _extract_python_code,
+    _code_generator,
     _provider_for_model as _executor_provider_for_model,
+    _record_tool_failure,
     _routing_reason_for_step,
-    _safe_api_call,
-    _safe_generate_code,
-    _safe_web_search,
+    _tool_result_payload,
 )
+from agent.tools.dispatch import run_step_tool
 from agent.nodes.reflector import reflector_node
 from agent.nodes.validator import (
     VALIDATOR_SYSTEM_PROMPT,
@@ -691,56 +691,18 @@ class ParallelExecutor:
                 )
                 return result, "pass", "No validation needed for pass-through step", {}, None, None
 
-            if step.tool_needed == "web_search":
-                tool_used = "web_search"
-                tool_result = _safe_web_search(step.description)
-                if tool_result.get("success"):
-                    user_prompt = f"{user_prompt}\n\nSearch Results: {json.dumps(tool_result, ensure_ascii=True)}"
-                else:
-                    tool_used = None
-                    tool_result = None
-
-            elif step.tool_needed == "api_call":
-                tool_used = "api_call"
-                tool_result = _safe_api_call(step.description)
-                if tool_result.get("success"):
-                    user_prompt = f"{user_prompt}\n\nAPI Response: {json.dumps(tool_result, ensure_ascii=True)}"
-                else:
-                    tool_used = None
-                    tool_result = None
-
-            elif step.tool_needed == "code_exec":
-                tool_used = "code_exec"
-                code_response = await _safe_generate_code(
-                    original_input=state.get("original_input", ""),
-                    step_name=step.name,
-                    step_description=step.description,
-                    task_id=state["task_id"],
-                    step_id=step.step_id,
-                )
-                if code_response is None:
-                    tool_used = None
-                    tool_result = None
-                else:
-                    generated_code = _extract_python_code(code_response.text)
-                    from agent.tools import execute_python_code  # Local import to avoid startup overhead
-
-                    execution_result = execute_python_code(generated_code)
-                    if execution_result.get("success"):
-                        tool_result = {
-                            "generated_code": generated_code,
-                            "execution": execution_result,
-                            "generation_model": code_response.model_used,
-                        }
-                        user_prompt = f"{user_prompt}\n\nCode Execution Output: {json.dumps(tool_result, ensure_ascii=True)}"
-                        await self._add_tokens(state=state, tokens=code_response.tokens_used)
-                    else:
-                        tool_used = None
-                        tool_result = None
+            tool_outcome = await run_step_tool(step, generate_code=_code_generator(state))
+            if tool_outcome.tool is not None:
+                tool_used = tool_outcome.tool
+                tool_result = _tool_result_payload(tool_outcome)
+                user_prompt = f"{user_prompt}\n\n{tool_outcome.prompt_block}"
+                await self._add_tokens(state=state, tokens=tool_outcome.tokens_used)
+                if tool_outcome.failed:
+                    _record_tool_failure(state=state, step=step, outcome=tool_outcome)
 
             if multi_agent_mode:
                 coordinator = get_agent_coordinator()
-                enriched_step = _build_agent_step_for_execution(step=step, tool_result=tool_result)
+                enriched_step = _build_agent_step_for_execution(step=step, tool_block=tool_outcome.prompt_block)
                 coordinator_result, assigned_agent = await coordinator.execute_step_with_agent(
                     step=enriched_step,
                     state=state,
