@@ -10,7 +10,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from agent.graph import resume_agent
+from agent.graph import continue_task, get_task_state
 from services.redis_service import get_redis_service
 
 logger = logging.getLogger(__name__)
@@ -38,8 +38,7 @@ class ExecuteResponse(BaseModel):
 async def execute_task(task_id: str):
     """Load checkpoint and start full graph execution in background."""
     try:
-        redis = get_redis_service()
-        state = await redis.load_checkpoint(task_id)
+        state = await get_task_state(task_id)
         if state is None:
             return _error_response(status_code=404, message=f"Task not found: {task_id}")
 
@@ -163,8 +162,7 @@ async def _run_execution(task_id: str) -> None:
     redis = get_redis_service()
 
     try:
-        final_state = await resume_agent(task_id)
-        await redis.save_checkpoint(task_id, final_state)
+        final_state = await continue_task(task_id)
 
         final_status = str(final_state.get("status") or "failed").lower()
         event_type = "task_completed" if final_status == "completed" else "task_failed"

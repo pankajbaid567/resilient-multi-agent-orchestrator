@@ -1,843 +1,282 @@
-"""LangGraph orchestration DAG for planner, executor, validator, reflection, and finalization."""
+"""Task graph: planner -> (pause for plan approval) -> scheduler <-> step workers -> finalizer.
+
+    START -> planner -> scheduler --Send(step_worker) x N--> step_worker -> scheduler
+                           |--> budget_stop -> finalizer -> END
+                           '--> finalizer -> END
+
+* The planner writes a dependency graph of steps. The run pauses after planning
+  (``interrupt_after``): POST /tasks returns the plan, POST /tasks/{id}/execute resumes it.
+* The scheduler dispatches every step whose dependencies have finished, using LangGraph
+  ``Send`` (one per step, up to MAX_CONCURRENT_STEPS when PARALLEL_MODE is on, else one).
+  Each step runs its own subgraph (agent/step_graph.py) and returns a state delta.
+* The checkpointer saves state after every super-step (thread_id = task_id), so a crashed
+  or restarted run resumes from the last finished wave of steps.
+"""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from functools import wraps
+from contextlib import AsyncExitStack
+from datetime import datetime, timedelta, timezone
 import logging
-from typing import Any, Awaitable, Callable, cast
+from typing import Any, Awaitable, Callable
 
-from langgraph.graph import END, StateGraph
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.types import Send
 
-from agent.parallel import ExecutionDAG, ParallelExecutor
-from config import get_settings
-from agent.nodes.executor import executor_node
+from agent.checkpointing import open_checkpointer
+from agent.events import emit, trace
 from agent.nodes.finalizer import finalizer_node
 from agent.nodes.planner import planner_node
-from agent.nodes.validator import validator_node
-from agent.state import AgentState, create_initial_state
-from models import StepDefinition, StepResult, TraceEntry
-from services.redis_service import get_redis_service
+from agent.parallel.dag import ExecutionDAG
+from agent.state import AgentState, create_initial_state, final_results_by_step
+from agent.step_graph import run_step
+from config import get_settings
+from services.usage import total_tokens, usage_scope
 
 logger = logging.getLogger(__name__)
 
-CompiledGraph = Any
-START_NODE = "__start__"
-NODE_PLANNER = "planner_node"
-NODE_EXECUTOR = "executor_node"
-NODE_VALIDATOR = "validator_node"
-NODE_ADVANCE = "advance_step_node"
-NODE_RETRY = "prepare_retry_node"
-NODE_REFLECTOR = "reflector_node"
-NODE_PARALLEL_EXECUTOR = "parallel_executor_node"
-NODE_FINALIZER = "finalizer_node"
-NODE_BUDGET = "budget_stop_node"
-
-STEP_STATUS_VALUES = {
-    "pending",
-    "running",
-    "success",
-    "failed",
-    "retrying",
-    "reflecting",
-    "skipped",
-}
-NodeCallable = Callable[[AgentState], Awaitable[AgentState]]
-
-try:
-    from agent.nodes.reflector import reflector_node as _reflector_node
-except ImportError:
-    _reflector_node = None
-
-
-def budget_exceeded(state: AgentState) -> str | None:
-    """Return a reason when the task has used its token budget or passed its deadline."""
-    token_budget = _safe_int(getattr(get_settings(), "TASK_TOKEN_BUDGET", 0), default=0)
-    if token_budget > 0 and _safe_int(state.get("llm_tokens_used"), default=0) >= token_budget:
-        return f"token budget reached ({state.get('llm_tokens_used')} >= {token_budget})"
-
-    deadline = _safe_int(getattr(get_settings(), "TASK_DEADLINE_SECONDS", 0), default=0)
-    started_at = state.get("started_at")
-    if deadline > 0 and started_at:
-        try:
-            started = datetime.fromisoformat(str(started_at))
-        except ValueError:
-            return None
-        if started.tzinfo is None:
-            started = started.replace(tzinfo=timezone.utc)
-        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
-        if elapsed >= deadline:
-            return f"deadline reached ({int(elapsed)}s >= {deadline}s)"
-    return None
-
-
-def route_after_validation(state: AgentState) -> str:
-    """Determine next action based on validation verdict, retry limits and the task budget."""
-    try:
-        if state.get("status") == "failed":
-            return "finalizer"
-
-        if not state["steps"] or not state["step_results"]:
-            return "finalizer"
-
-        if state["current_step_index"] >= len(state["steps"]):
-            return "finalizer"
-
-        if budget_exceeded(state):
-            return "budget"
-
-        latest_result = state["step_results"][-1]
-        current_step = state["steps"][state["current_step_index"]]
-
-        if latest_result.validation == "pass":
-            if state["current_step_index"] >= len(state["steps"]) - 1:
-                return "finalizer"
-            return "next_step"
-
-        if latest_result.validation == "retry":
-            max_retries = max(0, _safe_int(getattr(get_settings(), "MAX_RETRIES", 3), default=3))
-            if state["retry_counts"].get(current_step.step_id, 0) >= max_retries:
-                return "reflect"
-            return "retry"
-
-        # "reflect": the reflector owns the limits (per-step SKIP, global ABORT), so a
-        # persistent failure on one step no longer ends the whole task silently.
-        return "reflect"
-    except Exception as exc:  # pragma: no cover - defensive routing fallback
-        logger.exception("route_after_validation_failed: %s", exc)
-        _mark_node_exception(state, "route_after_validation", exc)
-        return "finalizer"
-
-
-def route_after_reflection(state: AgentState) -> str:
-    """After reflection, stop if the task was aborted or every step has been handled."""
-    if state.get("status") == "failed":
-        return "finalizer"
-    if state["current_step_index"] >= len(state["steps"]):
-        return "finalizer"
-    if budget_exceeded(state):
-        return "budget"
-    return "executor"
-
-
-async def budget_stop_node(state: AgentState) -> AgentState:
-    """Record why the run stopped early; the finalizer then reports partial results."""
-    reason = budget_exceeded(state) or "budget exceeded"
-    timestamp = datetime.now(timezone.utc).isoformat()
-    state["error_log"].append(
-        {"timestamp": timestamp, "step_id": None, "error_type": "BUDGET_EXCEEDED", "error_message": reason}
-    )
-    state["execution_trace"].append(
-        TraceEntry(timestamp=timestamp, event_type="budget_exceeded", details={"reason": reason}).model_dump()
-    )
-    await _publish_event(task_id=state["task_id"], event_type="budget_exceeded", data={"reason": reason})
-    return state
-
-
-async def advance_step_node(state: AgentState) -> AgentState:
-    """Increment current_step_index, update step status, and publish step-started event."""
-    if state["current_step_index"] < len(state["steps"]):
-        state["current_step_index"] += 1
-
-    next_step = None
-    if state["current_step_index"] < len(state["steps"]):
-        next_step = state["steps"][state["current_step_index"]]
-        await _update_step_status(
-            task_id=state["task_id"],
-            step_index=state["current_step_index"],
-            status="running",
-        )
-
-    await _publish_event(
-        task_id=state["task_id"],
-        event_type="step_started",
-        data={
-            "current_step_index": state["current_step_index"],
-            "step_id": next_step.step_id if next_step else None,
-            "step_name": next_step.name if next_step else None,
-        },
-    )
-    return state
-
-
-async def prepare_retry_node(state: AgentState) -> AgentState:
-    """Increment retry count, remove last failed result, and mark step as retrying."""
-    if state["current_step_index"] >= len(state["steps"]):
-        return state
-
-    step_id = state["steps"][state["current_step_index"]].step_id
-    state["retry_counts"][step_id] = state["retry_counts"].get(step_id, 0) + 1
-
-    if state["step_results"] and state["step_results"][-1].step_id == step_id:
-        state["step_results"].pop()
-
-    timestamp = datetime.now(timezone.utc).isoformat()
-    retry_count = state["retry_counts"][step_id]
-    state["execution_trace"].append(
-        TraceEntry(
-            timestamp=timestamp,
-            event_type="retry_triggered",
-            step_id=step_id,
-            details={"retry_count": retry_count},
-        ).model_dump()
-    )
-    await _publish_event(
-        task_id=state["task_id"],
-        event_type="retry_triggered",
-        data={"step_id": step_id, "retry_count": retry_count},
-    )
-    await _update_step_status(
-        task_id=state["task_id"],
-        step_index=state["current_step_index"],
-        status="retrying",
-    )
-    return state
-
-
-async def placeholder_reflector(state: AgentState) -> AgentState:
-    """Temporary: skip step instead of reflecting."""
-    if state["current_step_index"] >= len(state["steps"]):
-        return state
-
-    state["status"] = "reflecting"
-    step = state["steps"][state["current_step_index"]]
-    state["reflection_counts"][step.step_id] = state["reflection_counts"].get(step.step_id, 0) + 1
-
-    reason = "Reflector node unavailable; skipping step."
-    if state["step_results"] and state["step_results"][-1].step_id == step.step_id:
-        latest = state["step_results"][-1]
-        latest.status = "skipped"
-        latest.validation = "pass"
-        latest.error = latest.error or reason
-    else:
-        state["step_results"].append(
-            StepResult(
-                step_id=step.step_id,
-                status="skipped",
-                output="",
-                tokens_used=0,
-                latency_ms=0,
-                model_used="",
-                tool_used=None,
-                tool_result=None,
-                retry_count=state["retry_counts"].get(step.step_id, 0),
-                validation="pass",
-                error=reason,
-            )
-        )
-
-    state["current_step_index"] += 1
-    timestamp = datetime.now(timezone.utc).isoformat()
-    state["execution_trace"].append(
-        TraceEntry(
-            timestamp=timestamp,
-            event_type="reflection_completed",
-            step_id=step.step_id,
-            step_name=step.name,
-            details={"placeholder": True, "reason": reason},
-        ).model_dump()
-    )
-    await _publish_event(
-        task_id=state["task_id"],
-        event_type="reflection_completed",
-        data={"step_id": step.step_id, "placeholder": True, "reason": reason},
-    )
-    return state
-
-
-async def parallel_executor_node(state: AgentState) -> AgentState:
-    """Execute planned steps through DAG levels when PARALLEL_MODE is enabled."""
-    state["status"] = "executing"
-
-    if not state.get("steps"):
-        return state
-
-    try:
-        dag: ExecutionDAG | None = None
-        raw_dag = state.get("execution_dag")
-        if isinstance(raw_dag, dict) and raw_dag:
-            try:
-                dag = ExecutionDAG.from_dict(raw_dag)
-            except Exception as exc:  # pragma: no cover - defensive hydration fallback
-                logger.warning("parallel_executor_dag_restore_failed task_id=%s error=%s", state.get("task_id"), exc)
-
-        if dag is None:
-            dag = ExecutionDAG.from_steps(state["steps"])
-
-        is_valid, validation_error = dag.validate()
-        if not is_valid:
-            raise ValueError(validation_error or "Parallel execution DAG validation failed")
-
-        levels = dag.get_execution_levels()
-        state["execution_dag"] = dag.to_dict()
-        state["execution_levels"] = levels
-
-        max_concurrent = max(1, _safe_int(getattr(get_settings(), "MAX_CONCURRENT_STEPS", 5), default=5))
-        executor = ParallelExecutor(max_concurrent=max_concurrent)
-        updated_state = await executor.execute_dag(dag=dag, state=state)
-
-        if updated_state.get("status") != "failed":
-            updated_state["status"] = "executing"
-            updated_state["current_step_index"] = min(
-                len(updated_state.get("steps", [])),
-                len(updated_state.get("step_results", [])),
-            )
-
-        return updated_state
-    except Exception as exc:  # pragma: no cover - defensive runtime guard
-        logger.exception("parallel_executor_node_failed task_id=%s error=%s", state.get("task_id"), exc)
-        _mark_node_exception(state, NODE_PARALLEL_EXECUTOR, exc)
-        return state
-
-
-def with_checkpoint(node_func: NodeCallable) -> NodeCallable:
-    """Decorator that saves checkpoint after node execution."""
-
-    @wraps(node_func)
-    async def wrapper(state: AgentState) -> AgentState:
-        result = await node_func(state)
-        try:
-            redis = get_redis_service()
-            await redis.save_checkpoint(result["task_id"], result)
-            await redis.publish_event(
-                result["task_id"],
-                {
-                    "event_type": "checkpoint_saved",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "node": node_func.__name__,
-                    "step_index": result["current_step_index"],
-                    "status": result["status"],
-                },
-            )
-        except Exception as exc:  # pragma: no cover - checkpointing is non-fatal
-            logger.warning("Checkpoint save failed: %s", exc)
-        return result
-
-    return cast(NodeCallable, wrapper)
-
-
-def with_executor_status(node_func: NodeCallable) -> NodeCallable:
-    """Decorator that updates step status before and after executor runs."""
-
-    @wraps(node_func)
-    async def wrapper(state: AgentState) -> AgentState:
-        step_index = _safe_current_step_index(state)
-        if step_index is not None:
-            await _update_step_status(task_id=state["task_id"], step_index=step_index, status="running")
-
-        result = await node_func(state)
-
-        if step_index is None:
-            return result
-
-        resolved_status = _resolve_executor_step_status(result=result, step_index=step_index)
-        await _update_step_status(
-            task_id=result["task_id"],
-            step_index=step_index,
-            status=resolved_status,
-        )
-        return result
-
-    return cast(NodeCallable, wrapper)
-
-
-def build_graph(start_node: str = NODE_PLANNER) -> CompiledGraph:
-    """Build and compile the LangGraph state machine."""
-    graph = StateGraph(AgentState)
-
-    if bool(getattr(get_settings(), "PARALLEL_MODE", False)):
-        if start_node not in {
-            NODE_PLANNER,
-            NODE_PARALLEL_EXECUTOR,
-            NODE_FINALIZER,
-        }:
-            start_node = NODE_PLANNER
-
-        graph.add_node(NODE_PLANNER, _safe_node(NODE_PLANNER, with_checkpoint(planner_node)))
-        graph.add_node(
-            NODE_PARALLEL_EXECUTOR,
-            _safe_node(NODE_PARALLEL_EXECUTOR, with_checkpoint(parallel_executor_node)),
-        )
-        graph.add_node(NODE_FINALIZER, _safe_node(NODE_FINALIZER, with_checkpoint(finalizer_node)))
-
-        graph.add_edge(START_NODE, start_node)
-        graph.add_edge(NODE_PLANNER, NODE_PARALLEL_EXECUTOR)
-        graph.add_edge(NODE_PARALLEL_EXECUTOR, NODE_FINALIZER)
-        graph.add_edge(NODE_FINALIZER, END)
-        return graph.compile()
-
-    if start_node not in {
-        NODE_PLANNER,
-        NODE_EXECUTOR,
-        NODE_VALIDATOR,
-        NODE_ADVANCE,
-        NODE_RETRY,
-        NODE_REFLECTOR,
-        NODE_FINALIZER,
-    }:
-        start_node = NODE_PLANNER
-
-    graph.add_node(NODE_PLANNER, _safe_node(NODE_PLANNER, with_checkpoint(planner_node)))
-    graph.add_node(
-        NODE_EXECUTOR,
-        _safe_node(NODE_EXECUTOR, with_checkpoint(with_executor_status(executor_node))),
-    )
-    graph.add_node(NODE_VALIDATOR, _safe_node(NODE_VALIDATOR, with_checkpoint(validator_node)))
-    graph.add_node(NODE_ADVANCE, _safe_node(NODE_ADVANCE, advance_step_node))
-    graph.add_node(NODE_RETRY, _safe_node(NODE_RETRY, prepare_retry_node))
-    graph.add_node(NODE_REFLECTOR, _safe_node(NODE_REFLECTOR, with_checkpoint(_reflector_entry)))
-    graph.add_node(NODE_FINALIZER, _safe_node(NODE_FINALIZER, with_checkpoint(finalizer_node)))
-    graph.add_node(NODE_BUDGET, _safe_node(NODE_BUDGET, budget_stop_node))
-
-    graph.add_edge(START_NODE, start_node)
-    graph.add_edge(NODE_PLANNER, NODE_EXECUTOR)
-    graph.add_edge(NODE_EXECUTOR, NODE_VALIDATOR)
-    graph.add_conditional_edges(
-        NODE_VALIDATOR,
-        route_after_validation,
-        {
-            "next_step": NODE_ADVANCE,
-            "finalizer": NODE_FINALIZER,
-            "retry": NODE_RETRY,
-            "reflect": NODE_REFLECTOR,
-            "budget": NODE_BUDGET,
-        },
-    )
-    graph.add_edge(NODE_ADVANCE, NODE_EXECUTOR)
-    graph.add_edge(NODE_RETRY, NODE_EXECUTOR)
-    graph.add_conditional_edges(
-        NODE_REFLECTOR,
-        route_after_reflection,
-        {"executor": NODE_EXECUTOR, "finalizer": NODE_FINALIZER, "budget": NODE_BUDGET},
-    )
-    graph.add_edge(NODE_BUDGET, NODE_FINALIZER)
-    graph.add_edge(NODE_FINALIZER, END)
-
-    return graph.compile()
-
-
-def _graph_run_config() -> dict[str, int]:
-    """Return safe graph runtime config with recursion limit sized for this workflow."""
-
-    explicit_limit = get_settings().graph_recursion_limit
-    if explicit_limit > 0:
-        return {"recursion_limit": explicit_limit}
-
-    max_steps = max(_safe_int(getattr(get_settings(), "MAX_STEPS", 15), default=15), 1)
-    # Each logical step can span several graph node transitions.
-    derived_limit = max_steps * 8
-    return {"recursion_limit": max(derived_limit, 50)}
-
-
-async def run_agent(task_id: str, user_input: str) -> AgentState:
-    """Create initial state, build graph, and run full execution."""
-    state = create_initial_state(task_id, user_input)
-    await _ensure_task_started_event(state)
-    graph = build_graph(start_node=NODE_PLANNER)
-
-    try:
-        final_state = await graph.ainvoke(state, config=_graph_run_config())
-        return final_state
-    except Exception as exc:  # pragma: no cover - defensive top-level fallback
-        logger.exception("run_agent_failed task_id=%s error=%s", task_id, exc)
-        _mark_node_exception(state, "run_agent", exc)
-        state["completed_at"] = datetime.now(timezone.utc).isoformat()
-        state["status"] = "failed"
-        return state
-
-
-def build_agent_graph() -> CompiledGraph:
-    """Backward-compatible alias for build_graph."""
-    return build_graph()
-
-
-async def resume_agent(task_id: str) -> AgentState:
-    """Resume a task from its last checkpoint."""
-    redis = get_redis_service()
-    loaded_state = await redis.load_checkpoint(task_id)
-    if not loaded_state:
-        raise ValueError(f"No checkpoint found for task {task_id}")
-
-    if not isinstance(loaded_state, dict):
-        raise ValueError(f"Invalid checkpoint payload for task {task_id}")
-
-    state = _hydrate_state_from_checkpoint(loaded_state)
-    status = str(state.get("status") or "").lower()
-
-    if status in {"completed", "failed"}:
-        return state
-
-    await _ensure_task_started_event(state)
-
-    if bool(getattr(get_settings(), "PARALLEL_MODE", False)):
-        if status in {"executing", "running", "validating", "reflecting"}:
-            start_node = NODE_PARALLEL_EXECUTOR
-        else:
-            start_node = NODE_PLANNER
-    else:
-        if status in {"executing", "validating"}:
-            start_node = NODE_EXECUTOR
-        elif status == "reflecting":
-            start_node = NODE_REFLECTOR
-        elif status == "planning":
-            start_node = NODE_PLANNER
-        else:
-            start_node = NODE_EXECUTOR
-
-    graph = build_graph(start_node=start_node)
-    try:
-        final_state = await graph.ainvoke(state, config=_graph_run_config())
-        return final_state
-    except Exception as exc:  # pragma: no cover - defensive top-level fallback
-        logger.exception("resume_agent_failed task_id=%s error=%s", task_id, exc)
-        _mark_node_exception(state, "resume_agent", exc)
-        state["completed_at"] = datetime.now(timezone.utc).isoformat()
-        state["status"] = "failed"
-        return state
-
-
-async def _reflector_entry(state: AgentState) -> AgentState:
-    """Run reflector node if available, otherwise use placeholder fallback."""
-    if _reflector_node is None:
-        return await placeholder_reflector(state)
-    return await _reflector_node(state)
-
-
-def _safe_node(node_name: str, node_fn: NodeCallable):
-    """Wrap node execution and prevent unexpected exceptions from breaking the graph."""
-
-    async def _wrapped(state: AgentState) -> AgentState:
-        if state.get("status") == "failed" and node_name != "finalizer_node":
-            return state
-
-        try:
-            return await node_fn(state)
-        except Exception as exc:  # pragma: no cover - defensive runtime guard
-            logger.exception("node_failed node=%s error=%s", node_name, exc)
-            _mark_node_exception(state, node_name, exc)
-            return state
-
-    return _wrapped
-
-
-def _mark_node_exception(state: AgentState, node_name: str, error: Exception) -> None:
-    """Record node failure details and mark state as failed for finalization routing."""
-    timestamp = datetime.now(timezone.utc).isoformat()
-    step_id = None
-    if 0 <= state.get("current_step_index", 0) < len(state.get("steps", [])):
-        step_id = state["steps"][state["current_step_index"]].step_id
-
-    state["status"] = "failed"
-    state["error_log"].append(
-        {
-            "timestamp": timestamp,
-            "step_id": step_id,
-            "error_type": "NODE_EXCEPTION",
-            "node": node_name,
-            "error_message": str(error),
-        }
-    )
-    state["execution_trace"].append(
-        TraceEntry(
-            timestamp=timestamp,
-            event_type="task_failed",
-            step_id=step_id,
-            details={"node": node_name},
-            error=str(error),
-        ).model_dump()
-    )
-
-
-async def _publish_event(task_id: str, event_type: str, data: dict[str, Any]) -> None:
-    """Best-effort event publication to Redis for realtime consumers."""
-    payload = {
-        "event_type": event_type,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "task_id": task_id,
-        "data": data,
-    }
-
-    try:
-        redis = get_redis_service()
-        await redis.publish_event(task_id=task_id, event=payload)
-    except Exception as exc:  # pragma: no cover - event publication should not break execution
-        logger.warning("graph_event_publish_failed task_id=%s event_type=%s error=%s", task_id, event_type, exc)
-
-
-async def _ensure_task_started_event(state: AgentState) -> None:
-    """Ensure task_started exists once in execution trace and is broadcast to subscribers."""
-    existing_trace = state.get("execution_trace") or []
-    for event in existing_trace:
-        if isinstance(event, dict) and str(event.get("event_type") or "") == "task_started":
-            return
-
-    timestamp = datetime.now(timezone.utc).isoformat()
-    state["execution_trace"].append(
-        TraceEntry(
-            timestamp=timestamp,
-            event_type="task_started",
-            details={
-                "current_step_index": state.get("current_step_index", 0),
-                "status": state.get("status", "planning"),
-            },
-        ).model_dump()
-    )
-
-    await _publish_event(
-        task_id=state.get("task_id", ""),
-        event_type="task_started",
-        data={
-            "current_step_index": state.get("current_step_index", 0),
-            "status": state.get("status", "planning"),
-            "timestamp": timestamp,
-        },
-    )
-
-
-async def _update_step_status(task_id: str, step_index: int, status: str) -> None:
-    """Best-effort update of step status in Redis without breaking graph execution."""
-    normalized_status = _normalize_step_status(status)
-    try:
-        redis = get_redis_service()
-        await redis.update_step_status(task_id=task_id, step_index=step_index, status=normalized_status)
-    except Exception as exc:  # pragma: no cover - status updates are non-fatal
-        logger.warning(
-            "graph_step_status_update_failed task_id=%s step_index=%s status=%s error=%s",
-            task_id,
-            step_index,
-            normalized_status,
-            exc,
-        )
-
-
-def _normalize_step_status(status: str) -> str:
-    """Normalize arbitrary status labels to the allowed Redis step status values."""
-    candidate = str(status or "").strip().lower()
-    if candidate in STEP_STATUS_VALUES:
-        return candidate
-    return "running"
-
-
-def _safe_current_step_index(state: AgentState) -> int | None:
-    """Return a valid current step index when in-bounds, otherwise None."""
-    raw_index = state.get("current_step_index")
-    if not isinstance(raw_index, int):
-        return None
-    if raw_index < 0:
-        return None
-    if raw_index >= len(state.get("steps", [])):
-        return None
-    return raw_index
-
-
-def _resolve_executor_step_status(result: AgentState, step_index: int) -> str:
-    """Resolve persisted status for the current executor step from node result."""
-    if step_index < 0 or step_index >= len(result.get("steps", [])):
-        return "running"
-
-    current_step = result["steps"][step_index]
-    current_step_id = _extract_step_id(current_step)
-    latest_result = result["step_results"][-1] if result.get("step_results") else None
-    latest_step_id = _extract_step_id(latest_result)
-
-    if latest_result is not None and latest_step_id == current_step_id:
-        return _normalize_step_status(_extract_step_result_status(latest_result))
-
-    if str(result.get("status") or "").lower() == "failed":
-        return "failed"
-
-    return "running"
-
-
-def _extract_step_id(item: Any) -> str:
-    """Read step_id from StepDefinition/StepResult object or dict payload."""
-    if item is None:
-        return ""
-    if isinstance(item, dict):
-        return str(item.get("step_id") or "")
-    return str(getattr(item, "step_id", "") or "")
-
-
-def _extract_step_result_status(item: Any) -> str:
-    """Read status from StepResult object or dict payload."""
-    if item is None:
-        return "running"
-    if isinstance(item, dict):
-        return str(item.get("status") or "running")
-    return str(getattr(item, "status", "running") or "running")
-
-
-def _hydrate_state_from_checkpoint(raw_state: dict[str, Any]) -> AgentState:
-    """Hydrate Redis checkpoint payload into runtime AgentState model objects."""
-    hydrated: dict[str, Any] = dict(raw_state)
-    hydrated["steps"] = _hydrate_steps(raw_state.get("steps"))
-    hydrated["step_results"] = _hydrate_step_results(raw_state.get("step_results"))
-    hydrated["execution_trace"] = list(raw_state.get("execution_trace") or [])
-    hydrated["retry_counts"] = {
-        str(key): _safe_int(value, default=0)
-        for key, value in dict(raw_state.get("retry_counts") or {}).items()
-    }
-    hydrated["reflection_counts"] = {
-        str(key): _safe_int(value, default=0)
-        for key, value in dict(raw_state.get("reflection_counts") or {}).items()
-    }
-    hydrated["error_log"] = list(raw_state.get("error_log") or [])
-    hydrated["validation_log"] = list(raw_state.get("validation_log") or [])
-    hydrated["context_memory"] = [str(item) for item in list(raw_state.get("context_memory") or [])]
-    hydrated["llm_tokens_used"] = _safe_int(raw_state.get("llm_tokens_used"), default=0)
-    hydrated["status"] = str(raw_state.get("status") or "executing")
-    hydrated["started_at"] = str(raw_state.get("started_at") or datetime.now(timezone.utc).isoformat())
-    hydrated["completed_at"] = raw_state.get("completed_at")
-    hydrated["final_output"] = raw_state.get("final_output")
-    hydrated["confidence_score"] = raw_state.get("confidence_score")
-    hydrated["task_metrics"] = raw_state.get("task_metrics")
-    hydrated["execution_dag"] = raw_state.get("execution_dag")
-    hydrated["agent_assignments"] = {
-        str(key): str(value)
-        for key, value in dict(raw_state.get("agent_assignments") or {}).items()
-        if str(key)
-    }
-    hydrated["agent_contributions"] = {
-        str(key): dict(value) if isinstance(value, dict) else {}
-        for key, value in dict(raw_state.get("agent_contributions") or {}).items()
-    }
-
-    raw_levels = raw_state.get("execution_levels")
-    normalized_levels: list[list[str]] = []
-    if isinstance(raw_levels, list):
-        for level in raw_levels:
-            if not isinstance(level, list):
-                continue
-            normalized_levels.append([str(step_id) for step_id in level if str(step_id)])
-    hydrated["execution_levels"] = normalized_levels
-
-    raw_index = _safe_int(raw_state.get("current_step_index"), default=0)
-    step_count = len(hydrated["steps"])
-    hydrated["current_step_index"] = min(max(raw_index, 0), step_count)
-    hydrated["task_id"] = str(raw_state.get("task_id") or "")
-    hydrated["original_input"] = str(raw_state.get("original_input") or "")
-
-    return cast(AgentState, hydrated)
-
-
-def _hydrate_steps(raw_steps: Any) -> list[StepDefinition]:
-    """Convert checkpoint step payloads into StepDefinition objects."""
-    if not isinstance(raw_steps, list):
-        return []
-
-    hydrated_steps: list[StepDefinition] = []
-    for index, raw_step in enumerate(raw_steps, start=1):
-        if isinstance(raw_step, StepDefinition):
-            hydrated_steps.append(raw_step)
-            continue
-
-        if not isinstance(raw_step, dict):
-            continue
-
-        try:
-            hydrated_steps.append(StepDefinition(**raw_step))
-            continue
-        except Exception:
-            pass
-
-        step_id = str(raw_step.get("step_id") or f"step_{index}").strip() or f"step_{index}"
-        if not step_id.startswith("step_"):
-            step_id = f"step_{index}"
-
-        tool_needed = str(raw_step.get("tool_needed") or "llm_only").strip().lower()
-        if tool_needed not in {"web_search", "api_call", "code_exec", "llm_only", "none"}:
-            tool_needed = "llm_only"
-
-        complexity = str(raw_step.get("estimated_complexity") or "medium").strip().lower()
-        if complexity not in {"low", "medium", "high"}:
-            complexity = "medium"
-
-        dependencies_raw = raw_step.get("dependencies")
-        dependencies: list[str] = []
-        if isinstance(dependencies_raw, list):
-            dependencies = [str(dep) for dep in dependencies_raw if str(dep)]
-
-        try:
-            hydrated_steps.append(
-                StepDefinition(
-                    step_id=step_id,
-                    name=str(raw_step.get("name") or f"Step {index}"),
-                    description=str(raw_step.get("description") or raw_step.get("name") or f"Step {index}"),
-                    tool_needed=tool_needed,
-                    dependencies=dependencies,
-                    estimated_complexity=complexity,
-                )
-            )
-        except Exception:
-            hydrated_steps.append(
-                StepDefinition(
-                    step_id=f"step_{index}",
-                    name=f"Step {index}",
-                    description=f"Recovered step {index}",
-                    tool_needed="llm_only",
-                    dependencies=[],
-                    estimated_complexity="medium",
-                )
-            )
-
-    return hydrated_steps
-
-
-def _hydrate_step_results(raw_results: Any) -> list[StepResult]:
-    """Convert checkpoint step-result payloads into StepResult objects."""
-    if not isinstance(raw_results, list):
-        return []
-
-    hydrated_results: list[StepResult] = []
-    for index, raw_result in enumerate(raw_results, start=1):
-        if isinstance(raw_result, StepResult):
-            hydrated_results.append(raw_result)
-            continue
-
-        if not isinstance(raw_result, dict):
-            continue
-
-        try:
-            hydrated_results.append(StepResult(**raw_result))
-            continue
-        except Exception:
-            pass
-
-        status = str(raw_result.get("status") or "failed").strip().lower()
-        if status not in {"success", "failed", "skipped"}:
-            status = "failed"
-
-        step_id = str(raw_result.get("step_id") or f"step_{index}").strip() or f"step_{index}"
-        if not step_id.startswith("step_"):
-            step_id = f"step_{index}"
-
-        try:
-            hydrated_results.append(
-                StepResult(
-                    step_id=step_id,
-                    status=status,
-                    output=str(raw_result.get("output") or ""),
-                    tokens_used=_safe_int(raw_result.get("tokens_used"), default=0),
-                    latency_ms=_safe_int(raw_result.get("latency_ms"), default=0),
-                    model_used=str(raw_result.get("model_used") or ""),
-                    tool_used=raw_result.get("tool_used"),
-                    tool_result=raw_result.get("tool_result"),
-                    retry_count=_safe_int(raw_result.get("retry_count"), default=0),
-                    validation=raw_result.get("validation"),
-                    error=raw_result.get("error"),
-                    agent_name=raw_result.get("agent_name"),
-                    agent_role=raw_result.get("agent_role"),
-                )
-            )
-        except Exception:
-            continue
-
-    return hydrated_results
+NODE_PLANNER = "planner"
+NODE_SCHEDULER = "scheduler"
+NODE_STEP = "step_worker"
+NODE_BUDGET = "budget_stop"
+NODE_FINALIZER = "finalizer"
+
+APPEND_KEYS = {"step_results", "execution_trace", "error_log", "validation_log", "agent_messages", "llm_calls"}
+MERGE_KEYS = {"retry_counts", "reflection_counts", "agent_assignments"}
+MAX_CONTEXT_CHARS_PER_DEPENDENCY = 1_500
 
 
 def _safe_int(value: Any, default: int = 0) -> int:
-    """Best-effort integer coercion with default fallback."""
     try:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+async def _as_delta(fn: Callable[[dict], Awaitable[dict]], state: AgentState, node: str) -> dict[str, Any]:
+    """Run a node written in mutate-and-return style on a copy and return only what changed."""
+    working = {k: list(v) if isinstance(v, list) else dict(v) if isinstance(v, dict) else v for k, v in state.items()}
+    with usage_scope(node=node) as calls:
+        result = await fn(working)
+    delta: dict[str, Any] = {}
+    for key, value in result.items():
+        old = state.get(key)
+        if key in APPEND_KEYS:
+            new_items = list(value or [])[len(old or []):]
+            if new_items:
+                delta[key] = new_items
+        elif key == "llm_tokens_used":
+            continue  # counted from usage records below
+        elif key in MERGE_KEYS:
+            changed = {k: v for k, v in (value or {}).items() if (old or {}).get(k) != v}
+            if changed:
+                delta[key] = changed
+        elif value != old:
+            delta[key] = value
+    delta["llm_calls"] = [*delta.get("llm_calls", []), *calls]
+    delta["llm_tokens_used"] = total_tokens(calls)
+    return delta
+
+
+def budget_exceeded(state: AgentState) -> str | None:
+    """Return a reason when the task used its token budget or passed its deadline."""
+    settings = get_settings()
+    token_budget = _safe_int(settings.TASK_TOKEN_BUDGET)
+    if token_budget > 0 and _safe_int(state.get("llm_tokens_used")) >= token_budget:
+        return f"token budget reached ({state.get('llm_tokens_used')} >= {token_budget})"
+    deadline_at = _deadline_at(state)
+    if deadline_at and datetime.now(timezone.utc) >= deadline_at:
+        return f"deadline reached ({settings.TASK_DEADLINE_SECONDS}s)"
+    return None
+
+
+def _deadline_at(state: AgentState) -> datetime | None:
+    seconds = _safe_int(get_settings().TASK_DEADLINE_SECONDS)
+    started_at = state.get("started_at")
+    if seconds <= 0 or not started_at:
+        return None
+    started = datetime.fromisoformat(str(started_at))
+    if started.tzinfo is None:
+        started = started.replace(tzinfo=timezone.utc)
+    return started + timedelta(seconds=seconds)
+
+
+async def planner(state: AgentState) -> dict[str, Any]:
+    started = await emit(state["task_id"], trace("task_started", details={"status": "planning"}))
+    delta = await _as_delta(planner_node, state, NODE_PLANNER)
+    delta["execution_trace"] = [started, *delta.get("execution_trace", [])]
+    steps = delta.get("steps") or state.get("steps") or []
+    if delta.get("status") == "failed" or not steps:
+        delta["status"] = "failed"
+        return delta
+    dag = ExecutionDAG.from_steps(steps)
+    delta.update(status="planned", execution_dag=dag.to_dict(), execution_levels=dag.get_execution_levels())
+    delta["execution_trace"].append(await emit(state["task_id"], trace(
+        "plan_ready", details={"step_count": len(steps), "levels": delta["execution_levels"]})))
+    return delta
+
+
+async def scheduler(state: AgentState) -> dict[str, Any]:
+    finished = final_results_by_step(state)
+    return {"status": "executing" if state.get("status") != "failed" else "failed",
+            "current_step_index": len(finished)}
+
+
+def dispatch(state: AgentState) -> list[Send] | str:
+    """Send every ready step to a worker, or end the run."""
+    if state.get("status") == "failed" or state.get("abort_reason"):
+        return NODE_FINALIZER
+    if budget_exceeded(state):
+        return NODE_BUDGET
+
+    finished = final_results_by_step(state)
+    pending = [step for step in state.get("steps") or [] if step.step_id not in finished]
+    ready = [step for step in pending if all(dep in finished for dep in step.dependencies)]
+    if not ready:
+        return NODE_FINALIZER  # all done (or an unsatisfiable dependency, which the planner prevents)
+
+    settings = get_settings()
+    limit = max(1, _safe_int(settings.MAX_CONCURRENT_STEPS, 5)) if settings.PARALLEL_MODE else 1
+    deadline_at = _deadline_at(state)
+    token_budget = _safe_int(settings.TASK_TOKEN_BUDGET)
+    tokens_left = token_budget - _safe_int(state.get("llm_tokens_used")) if token_budget > 0 else 0
+    reflections_used = sum((state.get("reflection_counts") or {}).values())
+
+    sends = []
+    for step in ready[:limit]:
+        context = "\n".join(
+            f"- {dep} ({finished[dep].status}): {(finished[dep].output or '')[:MAX_CONTEXT_CHARS_PER_DEPENDENCY]}"
+            for dep in step.dependencies
+        )
+        sends.append(Send(NODE_STEP, {
+            "task_id": state["task_id"],
+            "original_input": state["original_input"],
+            "step": step,
+            "context": context,
+            "deadline_at": deadline_at.isoformat() if deadline_at else None,
+            "tokens_left": tokens_left,
+            "reflections_used_by_task": reflections_used,
+        }))
+    return sends
+
+
+async def step_worker(payload: dict[str, Any]) -> dict[str, Any]:
+    return await run_step(payload)
+
+
+async def budget_stop(state: AgentState) -> dict[str, Any]:
+    reason = budget_exceeded(state) or "budget exceeded"
+    entry = await emit(state["task_id"], trace("budget_exceeded", details={"reason": reason}))
+    return {
+        "execution_trace": [entry],
+        "error_log": [{"timestamp": entry["timestamp"], "step_id": None, "error_type": "BUDGET_EXCEEDED",
+                       "error_message": reason}],
+    }
+
+
+def agent_contributions(state: AgentState) -> dict[str, dict]:
+    """Per-agent steps handled and tokens used, from this task's final results only."""
+    contributions: dict[str, dict] = {}
+    for result in final_results_by_step(state).values():
+        if not result.agent_name:
+            continue
+        entry = contributions.setdefault(result.agent_name, {"steps_handled": 0, "total_tokens": 0,
+                                                             "roles_executed": []})
+        entry["steps_handled"] += 1
+        entry["total_tokens"] += result.tokens_used
+        if result.agent_role and result.agent_role not in entry["roles_executed"]:
+            entry["roles_executed"].append(result.agent_role)
+    return contributions
+
+
+async def finalizer(state: AgentState) -> dict[str, Any]:
+    delta = await _as_delta(finalizer_node, state, NODE_FINALIZER)
+    total = _safe_int(state.get("llm_tokens_used")) + delta["llm_tokens_used"]
+    final_output = delta.get("final_output") or state.get("final_output") or {}
+    summary = final_output.get("summary") or {}
+    summary["total_tokens"] = total
+    summary["llm_calls"] = len(state.get("llm_calls") or []) + len(delta["llm_calls"])
+    if state.get("abort_reason"):
+        delta["status"] = "failed"
+        summary["abort_reason"] = state["abort_reason"]
+    final_output["summary"] = summary
+    delta["final_output"] = final_output
+    delta["agent_contributions"] = agent_contributions(state)
+    delta["current_step_index"] = len(final_results_by_step(state))
+    return delta
+
+
+def build_graph(checkpointer: Any, pause_after_plan: bool = True):
+    graph = StateGraph(AgentState)
+    graph.add_node(NODE_PLANNER, planner)
+    graph.add_node(NODE_SCHEDULER, scheduler)
+    graph.add_node(NODE_STEP, step_worker)
+    graph.add_node(NODE_BUDGET, budget_stop)
+    graph.add_node(NODE_FINALIZER, finalizer)
+    graph.add_edge(START, NODE_PLANNER)
+    graph.add_edge(NODE_PLANNER, NODE_SCHEDULER)
+    graph.add_conditional_edges(NODE_SCHEDULER, dispatch, [NODE_STEP, NODE_BUDGET, NODE_FINALIZER])
+    graph.add_edge(NODE_STEP, NODE_SCHEDULER)
+    graph.add_edge(NODE_BUDGET, NODE_FINALIZER)
+    graph.add_edge(NODE_FINALIZER, END)
+    return graph.compile(checkpointer=checkpointer, interrupt_after=[NODE_PLANNER] if pause_after_plan else None)
+
+
+# ---- Runtime: one compiled graph per process ---------------------------------------------
+
+_graph: Any = None
+
+
+async def init_graph(stack: AsyncExitStack) -> Any:
+    """Compile the graph with the configured checkpointer (called from app startup)."""
+    global _graph
+    _graph = build_graph(await open_checkpointer(stack))
+    return _graph
+
+
+def get_graph() -> Any:
+    """Return the process graph, compiling one with an in-memory checkpointer if needed."""
+    global _graph
+    if _graph is None:
+        _graph = build_graph(InMemorySaver())
+    return _graph
+
+
+def reset_graph() -> None:
+    """Forget the compiled graph (tests use this for isolation)."""
+    global _graph
+    _graph = None
+
+
+def _config(task_id: str) -> dict[str, Any]:
+    return {"configurable": {"thread_id": task_id}, "recursion_limit": 200}
+
+
+async def plan_task(task_id: str, user_input: str) -> dict[str, Any]:
+    """Run the planner and pause; returns the state with the proposed steps."""
+    graph = get_graph()
+    await graph.ainvoke(create_initial_state(task_id, user_input), config=_config(task_id))
+    return (await graph.aget_state(_config(task_id))).values
+
+
+async def continue_task(task_id: str) -> dict[str, Any]:
+    """Resume a paused or interrupted run from its last checkpoint until it finishes."""
+    graph = get_graph()
+    snapshot = await graph.aget_state(_config(task_id))
+    if not snapshot.values:
+        raise ValueError(f"No saved state for task {task_id}")
+    if snapshot.next:
+        await graph.ainvoke(None, config=_config(task_id))
+    return (await graph.aget_state(_config(task_id))).values
+
+
+async def get_task_state(task_id: str) -> dict[str, Any] | None:
+    snapshot = await get_graph().aget_state(_config(task_id))
+    return dict(snapshot.values) if snapshot.values else None
+
+
+async def run_agent(task_id: str, user_input: str) -> dict[str, Any]:
+    """Plan and execute a task in one call (no pause for approval)."""
+    await plan_task(task_id, user_input)
+    return await continue_task(task_id)

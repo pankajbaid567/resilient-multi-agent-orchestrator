@@ -147,3 +147,31 @@ async def test_cancelled_probe_releases_the_half_open_slot(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert not await manager.is_open(key)  # the probe slot is free again
+
+
+def test_model_chain_is_configurable(settings):
+    from agent.reliability.fallback import default_chain
+
+    settings.MODEL_CHAIN = "gemini-flash, gemini-flash-lite ,gemini-flash"
+    assert [entry["model"] for entry in default_chain()] == ["gemini-flash", "gemini-flash-lite"]
+    assert [entry["model"] for entry in default_chain("gemini-pro")] == ["gemini-pro", "gemini-flash", "gemini-flash-lite"]
+
+
+async def test_temperature_can_be_omitted(monkeypatch, settings):
+    import services.llm_service as llm
+
+    sent: dict = {}
+
+    class Completions:
+        async def create(self, **kwargs):
+            sent.update(kwargs)
+            raise asyncio.TimeoutError()
+
+    class Client:
+        chat = type("Chat", (), {"completions": Completions()})()
+
+    monkeypatch.setattr(llm, "get_openai_client", lambda: Client())
+    settings.LLM_SEND_TEMPERATURE = False
+    with pytest.raises(LLMTimeoutError):
+        await call_llm("hi", timeout=1)
+    assert "temperature" not in sent

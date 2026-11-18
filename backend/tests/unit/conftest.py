@@ -43,6 +43,9 @@ def _reset_singletons(monkeypatch):
     from services import redis_service
 
     config.get_settings.cache_clear()
+    from agent.graph import reset_graph
+
+    reset_graph()
     circuit_breaker._manager = None
     chaos._chaos_middleware = None
     redis_service._redis_service = None

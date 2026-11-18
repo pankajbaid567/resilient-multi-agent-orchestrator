@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime, timezone
 from time import perf_counter
 
@@ -12,6 +12,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from agent.graph import init_graph
 from config import get_settings
 from routes import chaos_config_router, config_router, execute_router, metrics_router, tasks_router, traces_router
 from services import close_redis_client, get_redis_client
@@ -25,6 +26,8 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Initialize application resources and validate Redis reachability at startup, and close on shutdown."""
     logger.info("Agent API starting...")
+    stack = AsyncExitStack()
+    await init_graph(stack)
     try:
         redis_client = await get_redis_client()
         await redis_client.ping()
@@ -32,9 +35,11 @@ async def lifespan(app: FastAPI):
     except Exception as exc:  # pragma: no cover - defensive runtime logging
         logger.warning("Redis verification failed during startup: %s", exc)
     
-    yield
-    
-    await close_redis_client()
+    try:
+        yield
+    finally:
+        await stack.aclose()
+        await close_redis_client()
 
 app = FastAPI(
     title="Reliable AI Agent API",

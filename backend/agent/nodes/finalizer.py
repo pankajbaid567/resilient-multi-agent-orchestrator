@@ -197,7 +197,7 @@ async def _synthesize_final_output(state: AgentState) -> tuple[str, str, int]:
     """Generate final synthesized report text with LLM, falling back to concatenation."""
     synthesis_prompt = _build_synthesis_prompt(state)
     settings = get_settings()
-    model_name = settings.primary_model if settings.primary_model else "meta-llama/Llama-3.1-8B-Instruct"
+    model_name = settings.primary_model
     provider = _infer_provider(model_name)
 
     try:

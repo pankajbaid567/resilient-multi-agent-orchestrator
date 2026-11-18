@@ -27,6 +27,8 @@ def classify(system_prompt: str, prompt: str) -> str:
         return "planner"
     if "quality assurance judge" in text:
         return "validator"
+    if "supervisor of a team" in text:
+        return "supervisor"
     if "senior debugging engineer" in text:
         return "reflector"
     if "classify task steps" in text:
@@ -35,7 +37,7 @@ def classify(system_prompt: str, prompt: str) -> str:
         return "handoff"
     if "generate python code" in text:
         return "codegen"
-    if "synthes" in text or "final" in text and "report" in text:
+    if "you are a report synthesizer" in text:
         return "finalizer"
     return "executor"
 
@@ -85,10 +87,9 @@ class FakeLLM:
         if role == "reflector":
             return json.dumps({"action": "SKIP_STEP", "reasoning": "cannot be fixed", "modified_step": "",
                                "sub_steps": [], "partial_result": "partial"})
-        if role == "router":
-            return "analysis"
-        if role == "handoff":
-            return "handoff summary"
+        if role == "supervisor":
+            return json.dumps({"agent": "analysis", "brief": "Produce the facts this step asks for, clearly.",
+                               "reason": "analysis fits"})
         if role == "codegen":
             return "print(42)"
         if role == "finalizer":

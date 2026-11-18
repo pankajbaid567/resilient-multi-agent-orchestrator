@@ -2,15 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from dataclasses import dataclass
 import json
 import logging
 import re
 from typing import Any
 
-from agent.state import AgentState
 from config import get_settings
-from models import TraceEntry
 from services.llm_service import LLMError, call_llm
 
 logger = logging.getLogger(__name__)
@@ -46,6 +44,7 @@ Respond with JSON only:
 }}"""
 
 MAX_JUDGED_OUTPUT_CHARS = 6_000
+MIN_OUTPUT_CHARS = 40
 
 HALLUCINATION_MARKERS = [
     "As an AI",
@@ -84,112 +83,49 @@ def rule_based_validate(output: str, step_description: str) -> dict:
     return {"verdict": "pass", "reason": "rule-based pass"}
 
 
-async def validator_node(state: AgentState) -> AgentState:
-    """Validate the latest step result. Returns verdict: pass/retry/reflect."""
-    state["status"] = "validating"
-    latest_result = state["step_results"][-1] if state["step_results"] else None
+@dataclass(slots=True)
+class Judgement:
+    verdict: str  # pass | retry | reflect
+    reason: str
+    scores: dict[str, int]
+    source: str  # "deterministic" | "llm" | "rules"
 
-    if latest_result is None:
-        _append_validator_log(
-            state=state,
-            step_id="step_0",
-            verdict="retry",
-            reason="No step result available for validation.",
-            scores={},
-        )
-        return state
 
-    step = _find_step_by_id(state=state, step_id=latest_result.step_id)
-    step_name = step.name if step is not None else latest_result.step_id
-    step_description = step.description if step is not None else ""
-    output_text = latest_result.output or ""
+async def judge_output(step_name: str, step_description: str, output: str) -> Judgement:
+    """Decide pass / retry / reflect for one step output.
 
-    verdict = "retry"
-    reason = "Validation fallback applied"
-    scores: dict[str, int] = {}
+    Cheap deterministic checks run first; the LLM judge only sees outputs that pass them.
+    If the judge is unavailable or its reply cannot be parsed, keyword rules decide.
+    """
+    text = (output or "").strip()
+    if not text:
+        return Judgement("retry", "Step produced no output.", {}, "deterministic")
+    if len(text) < MIN_OUTPUT_CHARS:
+        return Judgement("retry", f"Output is too short ({len(text)} characters) to complete the step.", {},
+                         "deterministic")
 
-    if latest_result.status != "success" or not output_text.strip():
-        # Nothing to judge: an LLM call on an empty or failed output only costs tokens.
-        verdict = "retry"
-        reason = f"Step produced no usable output: {latest_result.error or 'empty output'}"
-        latest_result.validation = verdict
-        _append_validator_log(state=state, step_id=latest_result.step_id, verdict=verdict, reason=reason, scores={})
-        state["execution_trace"].append(
-            TraceEntry(
-                timestamp=datetime.now(timezone.utc).isoformat(),
-                event_type="step_failed",
-                step_id=latest_result.step_id,
-                step_name=step_name,
-                details={"validator_verdict": verdict, "validator_reason": reason, "judge_skipped": True},
-                error=reason,
-            ).model_dump()
-        )
-        return state
-
+    model_name = _get_validation_model()
     try:
-        model_name = _get_validation_model()
-        provider_name = _provider_for_model(model_name)
-        validation_prompt = VALIDATOR_USER_PROMPT_TEMPLATE.format(
-            step_name=step_name,
-            step_description=step_description,
-            step_output=output_text[:MAX_JUDGED_OUTPUT_CHARS],
-        )
-
-        llm_response = await call_llm(
-            prompt=validation_prompt,
+        response = await call_llm(
+            prompt=VALIDATOR_USER_PROMPT_TEMPLATE.format(
+                step_name=step_name,
+                step_description=step_description,
+                step_output=text[:MAX_JUDGED_OUTPUT_CHARS],
+            ),
             system_prompt=VALIDATOR_SYSTEM_PROMPT,
             model=model_name,
-            provider=provider_name,
+            provider=_provider_for_model(model_name),
             temperature=0.1,
-            max_tokens=1000,
+            max_tokens=400,
             json_mode=True,
             timeout=45,
         )
-        state["llm_tokens_used"] += llm_response.tokens_used
-        parsed = _parse_validation_response(llm_response.text)
-        verdict = parsed["verdict"]
-        reason = parsed["reason"]
-        scores = parsed["scores"]
+        parsed = _parse_validation_response(response.text)
+        return Judgement(parsed["verdict"], parsed["reason"], parsed["scores"], "llm")
     except (LLMError, ValueError, json.JSONDecodeError) as exc:
-        logger.warning("validator_llm_unavailable step_id=%s error=%s", latest_result.step_id, exc)
-        fallback = rule_based_validate(output=output_text, step_description=step_description)
-        verdict = str(fallback.get("verdict", "retry"))
-        reason = str(fallback.get("reason", "failed rule-based validation"))
-        scores = {}
-    except Exception as exc:  # pragma: no cover - defensive safety path
-        logger.warning("validator_unexpected_error step_id=%s error=%s", latest_result.step_id, exc)
-        fallback = rule_based_validate(output=output_text, step_description=step_description)
-        verdict = str(fallback.get("verdict", "retry"))
-        reason = str(fallback.get("reason", "failed rule-based validation"))
-        scores = {}
-
-    latest_result.validation = verdict
-
-    event_type = "step_completed" if verdict == "pass" else "step_failed"
-    state["execution_trace"].append(
-        TraceEntry(
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            event_type=event_type,
-            step_id=latest_result.step_id,
-            step_name=step_name,
-            details={
-                "validator_verdict": verdict,
-                "validator_reason": reason,
-                "scores": scores,
-                "output_length": len(output_text),
-            },
-            error=None if verdict == "pass" else reason,
-        ).model_dump()
-    )
-
-    _append_validator_log(
-        state=state,
-        step_id=latest_result.step_id,
-        verdict=verdict,
-        reason=reason,
-        scores=scores,
-    )
-    return state
+        logger.warning("judge_unavailable step=%s error=%s", step_name, exc)
+        fallback = rule_based_validate(output=text, step_description=step_description)
+        return Judgement(str(fallback["verdict"]), str(fallback["reason"]), {}, "rules")
 
 
 def _parse_validation_response(raw_text: str) -> dict[str, Any]:
@@ -287,43 +223,13 @@ def _extract_keywords(step_description: str) -> list[str]:
     return keywords[:12]
 
 
-def _append_validator_log(
-    state: AgentState,
-    step_id: str,
-    verdict: str,
-    reason: str,
-    scores: dict[str, int],
-) -> None:
-    """Append validator metadata used by graph routing, prompts and metrics.
-
-    Verdicts live in validation_log, not error_log: a passing verdict is not an error.
-    """
-    state.setdefault("validation_log", []).append(
-        {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "step_id": step_id,
-            "validator_verdict": verdict,
-            "reason": reason,
-            "scores": scores,
-        }
-    )
-
-
-def _find_step_by_id(state: AgentState, step_id: str):
-    """Return the matching step definition for a given step ID if present."""
-    for step in state["steps"]:
-        if step.step_id == step_id:
-            return step
-    return None
-
-
 def _get_validation_model() -> str:
     """Resolve configured validation model with fallback to a free open-source model."""
     settings = get_settings()
     configured = getattr(settings, "VALIDATION_MODEL", None)
     if isinstance(configured, str) and configured.strip():
         return configured.strip()
-    return "mistralai/Mistral-7B-Instruct-v0.3"
+    return settings.primary_model
 
 
 def _provider_for_model(model_name: str) -> str:

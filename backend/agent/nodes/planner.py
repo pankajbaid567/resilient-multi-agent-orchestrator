@@ -578,7 +578,7 @@ def _get_planner_model() -> str:
     configured = str(getattr(settings, "PRIMARY_MODEL", "") or "").strip()
     if configured:
         return configured
-    return "meta-llama/Llama-3.1-8B-Instruct"
+    return settings.primary_model
 
 
 def _provider_for_model(model_name: str) -> str:

@@ -19,7 +19,10 @@ logger = logging.getLogger(__name__)
 STATE_TTL_SECONDS = 86400
 CIRCUIT_TTL_SECONDS = 300
 RECONNECT_INTERVAL_SECONDS = 30.0
-MAX_QUEUED_EVENTS = 500
+MAX_STREAM_EVENTS = 1_000
+MAX_TASK_LOGS = 200
+STREAM_BLOCK_MS = 15_000
+TERMINAL_EVENTS = {"task_completed", "task_failed"}
 ALLOWED_STEP_STATUSES = {
     "pending",
     "running",
@@ -54,7 +57,8 @@ class RedisService:
         # In-memory fallback stores.
         self._state_store: dict[str, str] = {}
         self._step_store: dict[str, str] = {}
-        self._event_queues: dict[str, asyncio.Queue[dict[str, Any]]] = {}
+        self._event_logs: dict[str, list[dict[str, Any]]] = {}
+        self._event_conditions: dict[str, asyncio.Condition] = {}
 
     async def connect(self, retries: int = 3, delay: float = 1.0) -> bool:
         """Establish Redis connection with retries. Returns True if connected, False if falling back to memory."""
@@ -107,61 +111,6 @@ class RedisService:
             await self._safe_close_client()
             return False
 
-    # --- State Checkpointing ---
-
-    async def save_checkpoint(self, task_id: str, state: dict) -> None:
-        """Save full AgentState to Redis with 24h TTL.
-        Key: task:{task_id}:state
-        Falls back to in-memory dict if Redis unavailable."""
-        key = self._state_key(task_id)
-        payload = self._serialize(state)
-        client = await self._get_client()
-
-        if client is not None:
-            try:
-                await client.set(key, payload, ex=STATE_TTL_SECONDS)
-                return
-            except (RedisConnectionError, RedisError) as exc:
-                self._mark_fallback(exc)
-
-        self._state_store[key] = payload
-
-    async def load_checkpoint(self, task_id: str) -> dict[str, Any] | None:
-        """Load AgentState from Redis.
-        Returns None if task doesn't exist."""
-        key = self._state_key(task_id)
-        client = await self._get_client()
-
-        if client is not None:
-            try:
-                payload = await client.get(key)
-                if payload is None:
-                    return None
-                loaded = self._deserialize(payload)
-                return loaded if isinstance(loaded, dict) else None
-            except (RedisConnectionError, RedisError) as exc:
-                self._mark_fallback(exc)
-
-        payload = self._state_store.get(key)
-        if payload is None:
-            return None
-
-        loaded = self._deserialize(payload)
-        return loaded if isinstance(loaded, dict) else None
-
-    async def delete_checkpoint(self, task_id: str) -> None:
-        """Delete a task's checkpoint."""
-        key = self._state_key(task_id)
-        client = await self._get_client()
-
-        if client is not None:
-            try:
-                await client.delete(key)
-            except (RedisConnectionError, RedisError) as exc:
-                self._mark_fallback(exc)
-
-        self._state_store.pop(key, None)
-
     # --- Step Status ---
 
     async def update_step_status(self, task_id: str, step_index: int, status: str) -> None:
@@ -199,76 +148,74 @@ class RedisService:
 
         return self._step_store.get(key)
 
-    # --- Pub/Sub ---
+    # --- Live events (Redis Streams) ---
+    #
+    # Events go to a per-task stream (XADD, capped length, 24 h TTL). A subscriber reads
+    # from the beginning of the stream, so a client that connects late, or reconnects,
+    # replays everything it missed; plain pub/sub dropped those events. Without Redis, a
+    # bounded in-memory log per task gives the same replay semantics within one process.
 
     async def publish_event(self, task_id: str, event: dict) -> None:
-        """Publish event to channel task:{task_id}:events.
-        Event must include: event_type, timestamp, and event-specific data.
-        Falls back to asyncio.Queue in memory mode."""
+        """Append an event (must include event_type and timestamp) to the task's stream."""
         if "event_type" not in event or "timestamp" not in event:
             raise ValueError("event must include 'event_type' and 'timestamp'")
 
-        channel = self._events_channel(task_id)
         payload = self._serialize(event)
         client = await self._get_client()
-
         if client is not None:
             try:
-                await client.publish(channel, payload)
+                key = self._events_stream(task_id)
+                await client.xadd(key, {"data": payload}, maxlen=MAX_STREAM_EVENTS, approximate=True)
+                await client.expire(key, STATE_TTL_SECONDS)
                 return
             except (RedisConnectionError, RedisError) as exc:
                 self._mark_fallback(exc)
 
-        queue = self._event_queues.setdefault(task_id, asyncio.Queue(maxsize=MAX_QUEUED_EVENTS))
         normalized = self._deserialize(payload)
-        if isinstance(normalized, dict):
-            if queue.full():
-                queue.get_nowait()  # drop the oldest event rather than grow without bound
-            queue.put_nowait(normalized)
+        if not isinstance(normalized, dict):
+            return
+        log = self._event_logs.setdefault(task_id, [])
+        log.append(normalized)
+        if len(log) > MAX_STREAM_EVENTS:
+            del log[: len(log) - MAX_STREAM_EVENTS]
+        while len(self._event_logs) > MAX_TASK_LOGS:
+            self._event_logs.pop(next(iter(self._event_logs)))
+        condition = self._event_conditions.setdefault(task_id, asyncio.Condition())
+        async with condition:
+            condition.notify_all()
 
-    async def subscribe_events(self, task_id: str) -> AsyncGenerator[dict[str, Any], None]:
-        """Subscribe to task events. Yields parsed JSON events.
-        In memory mode, reads from asyncio.Queue."""
-        channel = self._events_channel(task_id)
+    async def subscribe_events(self, task_id: str, from_start: bool = True) -> AsyncGenerator[dict[str, Any], None]:
+        """Yield the task's events (replaying earlier ones), ending after a terminal event."""
         client = await self._get_client()
-
         if client is not None:
-            pubsub = client.pubsub()
+            key = self._events_stream(task_id)
+            last_id = "0-0" if from_start else "$"
             try:
-                await pubsub.subscribe(channel)
-                async for message in pubsub.listen():
-                    if message.get("type") != "message":
-                        continue
-
-                    raw_payload = message.get("data")
-                    if raw_payload is None:
-                        continue
-
-                    event = self._deserialize(raw_payload)
-                    if isinstance(event, dict):
-                        yield event
-                return
+                while True:
+                    response = await client.xread({key: last_id}, block=STREAM_BLOCK_MS, count=100)
+                    for _stream, entries in response or []:
+                        for entry_id, fields in entries:
+                            last_id = entry_id
+                            event = self._deserialize(fields.get("data", "{}"))
+                            if isinstance(event, dict):
+                                yield event
+                                if str(event.get("event_type") or "") in TERMINAL_EVENTS:
+                                    return
             except (RedisConnectionError, RedisError) as exc:
                 self._mark_fallback(exc)
-            finally:
-                try:
-                    await pubsub.unsubscribe(channel)
-                except (RedisConnectionError, RedisError):
-                    pass
-                try:
-                    await pubsub.aclose()
-                except (RedisConnectionError, RedisError):
-                    pass
 
-        queue = self._event_queues.setdefault(task_id, asyncio.Queue(maxsize=MAX_QUEUED_EVENTS))
-        try:
-            while True:
-                event = await queue.get()
+        index = 0 if from_start else len(self._event_logs.get(task_id, []))
+        condition = self._event_conditions.setdefault(task_id, asyncio.Condition())
+        while True:
+            log = self._event_logs.get(task_id, [])
+            while index < len(log):
+                event = log[index]
+                index += 1
                 yield event
-                if str(event.get("event_type") or "") in {"task_completed", "task_failed"}:
+                if str(event.get("event_type") or "") in TERMINAL_EVENTS:
                     return
-        finally:
-            self._event_queues.pop(task_id, None)
+            async with condition:
+                await condition.wait()
 
     # --- Circuit Breaker State ---
 
@@ -382,16 +329,12 @@ class RedisService:
         return normalized
 
     @staticmethod
-    def _state_key(task_id: str) -> str:
-        return f"task:{task_id}:state"
-
-    @staticmethod
     def _step_status_key(task_id: str, step_index: int) -> str:
         return f"task:{task_id}:step:{step_index}:status"
 
     @staticmethod
-    def _events_channel(task_id: str) -> str:
-        return f"task:{task_id}:events"
+    def _events_stream(task_id: str) -> str:
+        return f"task:{task_id}:stream"
 
     @staticmethod
     def _circuit_key(provider: str) -> str:

@@ -13,8 +13,8 @@ class SpecializedAgent:
     name: str
     role: str
     system_prompt: str
-    tools: List[str]
-    preferred_model: str
+    tools: List[str]  # tool names this role may call from its ReAct loop (see agent/tools/registry.py)
+    preferred_model: str  # empty: use the configured model chain (MODEL_CHAIN / PRIMARY_MODEL)
     temperature: float
     description: str
 
@@ -37,8 +37,8 @@ RESEARCH_AGENT = SpecializedAgent(
         "flair. Your output should help other agents reason accurately by preserving factual fidelity, "
         "traceability, and context boundaries across the workflow."
     ),
-    tools=["web_search", "api_call"],
-    preferred_model="meta-llama/Llama-3.1-8B-Instruct",
+    tools=["web_search", "http_get"],
+    preferred_model="",
     temperature=0.3,
     description="Specialized in web research, data gathering, and source synthesis",
 )
@@ -61,8 +61,8 @@ CODE_AGENT = SpecializedAgent(
         "unnecessary dependencies. Keep style consistent with project conventions and produce output that "
         "another engineer can adopt immediately without ambiguity."
     ),
-    tools=["code_exec", "llm_only"],
-    preferred_model="meta-llama/Llama-3.1-8B-Instruct",
+    tools=["python"],
+    preferred_model="",
     temperature=0.2,
     description="Specialized in code generation, testing, and technical implementation",
 )
@@ -84,8 +84,8 @@ ANALYSIS_AGENT = SpecializedAgent(
         "complete enough for a downstream writing or execution agent to act without re-deriving your logic. "
         "Your output should maximize decision quality through rigor, coherence, and traceable rationale."
     ),
-    tools=["llm_only"],
-    preferred_model="Qwen/Qwen2.5-7B-Instruct",
+    tools=[],
+    preferred_model="",
     temperature=0.5,
     description="Specialized in data analysis, comparison, and strategic reasoning",
 )
@@ -107,8 +107,8 @@ WRITING_AGENT = SpecializedAgent(
         "to scan, with bullets or numbered lists where they improve clarity. Your writing should feel "
         "intentional, concise, and trustworthy while preserving the nuance needed for informed action."
     ),
-    tools=["llm_only"],
-    preferred_model="Qwen/Qwen2.5-7B-Instruct",
+    tools=[],
+    preferred_model="",
     temperature=0.7,
     description="Specialized in report writing, synthesis, and documentation",
 )

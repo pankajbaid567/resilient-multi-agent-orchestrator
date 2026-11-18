@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from agent.reliability.chaos import get_chaos_middleware, set_chaos_mode as set_chaos_runtime_mode
+from agent.reliability.fallback import default_chain
 from config import get_settings
 from security import require_admin
 
@@ -18,11 +19,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["config"])
 
 # Runtime-only provider chain used by frontend settings panel.
-_runtime_provider_chain: list[dict[str, str]] = [
-    {"provider": "open_source", "model": "meta-llama/Llama-3.1-8B-Instruct", "label": "Primary (Llama 3.1)"},
-    {"provider": "open_source", "model": "Qwen/Qwen2.5-7B-Instruct", "label": "Fallback (Qwen 2.5)"},
-    {"provider": "open_source", "model": "mistralai/Mistral-7B-Instruct-v0.3", "label": "Fallback (Mistral 7B)"},
-]
+_runtime_provider_chain: list[dict[str, str]] = []  # display-only; empty means "show the configured chain"
 
 
 class RuntimeConfigResponse(BaseModel):
@@ -205,7 +202,7 @@ def _serialize_runtime_config(settings: Any) -> dict[str, Any]:
         "max_retries": int(getattr(settings, "MAX_RETRIES", 3)),
         "step_timeout": int(getattr(settings, "STEP_TIMEOUT", 60)),
         "max_concurrent_steps": int(getattr(settings, "MAX_CONCURRENT_STEPS", 5)),
-        "providers": list(_runtime_provider_chain),
+        "providers": list(_runtime_provider_chain) or default_chain(),
         "chaos_stats": {
             str(key): int(value)
             for key, value in get_chaos_middleware().get_stats().items()

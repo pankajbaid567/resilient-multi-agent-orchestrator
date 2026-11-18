@@ -12,6 +12,7 @@ from anthropic import AsyncAnthropic
 from openai import AsyncOpenAI
 
 from config import get_settings
+from services.usage import record_llm_call
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +95,7 @@ def get_anthropic_client() -> AsyncAnthropic:
 async def call_llm(
     prompt: str,
     system_prompt: str = "You are a helpful AI assistant.",
-    model: str = "meta-llama/Llama-3.1-8B-Instruct",
+    model: str = "",
     provider: str = "open_source",
     temperature: float = 0.7,
     max_tokens: int = 4096,
@@ -107,6 +108,7 @@ async def call_llm(
     For Anthropic calls, this uses messages.create via AsyncAnthropic.
     """
     normalized_provider = provider.strip().lower()
+    model = model or get_settings().primary_model
     started = perf_counter()
 
     if normalized_provider not in {"openai", "anthropic", "open_source"}:
@@ -148,6 +150,7 @@ async def call_llm(
             raise LLMResponseError("LLM returned an empty response body")
 
         latency_ms = int((perf_counter() - started) * 1000)
+        record_llm_call(model_used, normalized_provider, input_tokens, output_tokens, latency_ms, ok=True)
         logger.info(
             "llm_call_success provider=%s model=%s tokens=%s latency_ms=%s",
             normalized_provider,
@@ -164,8 +167,9 @@ async def call_llm(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
         )
-    except LLMError:
+    except LLMError as exc:
         latency_ms = int((perf_counter() - started) * 1000)
+        record_llm_call(model, normalized_provider, 0, 0, latency_ms, ok=False, error=type(exc).__name__)
         logger.warning(
             "llm_call_failed provider=%s model=%s tokens=%s latency_ms=%s",
             normalized_provider,
@@ -177,6 +181,7 @@ async def call_llm(
     except Exception as exc:
         mapped_error = _map_provider_error(exc, provider=normalized_provider, model=model)
         latency_ms = int((perf_counter() - started) * 1000)
+        record_llm_call(model, normalized_provider, 0, 0, latency_ms, ok=False, error=type(mapped_error).__name__)
         logger.warning(
             "llm_call_failed provider=%s model=%s tokens=%s latency_ms=%s error=%s",
             normalized_provider,
@@ -205,9 +210,10 @@ async def _call_openai(
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ],
-        "temperature": temperature,
         "max_tokens": max_tokens,
     }
+    if get_settings().LLM_SEND_TEMPERATURE:
+        request_kwargs["temperature"] = temperature
     if json_mode:
         request_kwargs["response_format"] = {"type": "json_object"}
 

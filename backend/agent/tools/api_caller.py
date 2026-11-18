@@ -112,71 +112,6 @@ async def call_api(
         )
 
 
-def call_api_sync(
-    method: str,
-    url: str,
-    headers: dict | None = None,
-    json_body: dict | None = None,
-    timeout_seconds: float = 30.0,
-) -> dict[str, Any]:
-    """Backward-compatible sync API used by current executor call-sites."""
-    started = perf_counter()
-    refusal = _refusal(str(url or ""), started)
-    if refusal:
-        return {"success": False, "data": {}, "error_message": refusal, "latency_ms": _latency_ms(started), "tool_name": "api_caller"}
-    normalized_method = str(method or "GET").upper()
-    normalized_url = str(url or "").strip()
-
-    if not normalized_url:
-        return {
-            "success": False,
-            "data": {},
-            "error_message": "URL is required",
-            "latency_ms": _latency_ms(started),
-            "tool_name": "api_caller",
-        }
-
-    try:
-        with httpx.Client(timeout=timeout_seconds, follow_redirects=False) as client:
-            response = client.request(
-                method=normalized_method,
-                url=normalized_url,
-                headers=dict(headers or {}),
-                json=dict(json_body or {}) if json_body else None,
-            )
-
-        payload = {
-            "url": str(response.request.url),
-            "method": normalized_method,
-            "status_code": response.status_code,
-            "headers": dict(response.headers),
-            "body": _parse_body(response),
-        }
-        return {
-            "success": response.is_success,
-            "data": payload,
-            "error_message": "" if response.is_success else f"HTTP {response.status_code}",
-            "latency_ms": _latency_ms(started),
-            "tool_name": "api_caller",
-        }
-    except httpx.TimeoutException:
-        return {
-            "success": False,
-            "data": {},
-            "error_message": "API request timed out",
-            "latency_ms": _latency_ms(started),
-            "tool_name": "api_caller",
-        }
-    except Exception as exc:
-        return {
-            "success": False,
-            "data": {},
-            "error_message": str(exc),
-            "latency_ms": _latency_ms(started),
-            "tool_name": "api_caller",
-        }
-
-
 def _parse_body(response: httpx.Response) -> Any:
     """Parse response body as JSON when possible, else return text."""
     try:
@@ -190,4 +125,4 @@ def _latency_ms(started: float) -> int:
     return int((perf_counter() - started) * 1000)
 
 
-__all__ = ["call_api", "call_api_sync"]
+__all__ = ["api_call_enabled", "call_api"]

@@ -30,6 +30,15 @@ services:
         value: "false"
       - key: ENABLE_API_CALL
         value: "false"
+      # Supervisor picks the worker and writes its brief ("rules" skips that model call)
+      - key: SUPERVISOR_MODE
+        value: "llm"
+      # memory | sqlite:///file.db | postgresql://... (e.g. free Neon) for resume across restarts
+      - key: CHECKPOINT_URL
+        value: "memory"
+      # Optional: comma-separated model chain for any OpenAI-compatible endpoint
+      - key: MODEL_CHAIN
+        sync: false
       - key: LOG_LEVEL
         value: "INFO"
       - key: OPEN_SOURCE_BASE_URL

@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from agent.state import AgentState
 from models import TraceEntry
 from models.metrics import TraceSummary
-from services.redis_service import get_redis_service
+from agent.graph import get_task_state
 from services.metrics_service import get_metrics_service
 
 logger = logging.getLogger(__name__)
@@ -41,8 +41,7 @@ class TraceResponse(BaseModel):
 async def get_trace(task_id: str):
     """Load execution trace timeline for a task from Redis checkpoint state."""
     try:
-        redis = get_redis_service()
-        state = await redis.load_checkpoint(task_id)
+        state = await get_task_state(task_id)
         if state is None:
             return _error_response(status_code=404, message=f"Task not found: {task_id}")
 
@@ -98,8 +97,7 @@ def _normalize_trace(value: Any) -> list[dict[str, Any]]:
 
 async def _load_task_state(task_id: str) -> AgentState:
     """Load task state from Redis checkpoint or raise 404 when missing."""
-    redis = get_redis_service()
-    state = await redis.load_checkpoint(task_id)
+    state = await get_task_state(task_id)
     if state is None:
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
     if not isinstance(state, dict):

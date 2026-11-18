@@ -10,7 +10,7 @@ from agent.reliability.circuit_breaker import get_circuit_breaker_manager
 from agent.state import AgentState
 from models import AggregateMetrics, TaskMetrics
 from services.metrics_service import get_metrics_service
-from services.redis_service import get_redis_service
+from agent.graph import get_task_state
 
 router = APIRouter(tags=["metrics"])
 
@@ -60,8 +60,7 @@ async def get_task_metrics(task_id: str) -> TaskMetrics:
     if metrics is not None:
         return metrics
 
-    redis = get_redis_service()
-    state = await redis.load_checkpoint(task_id)
+    state = await get_task_state(task_id)
     if state is None:
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
     if not isinstance(state, dict):

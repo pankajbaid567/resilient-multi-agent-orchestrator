@@ -10,12 +10,10 @@ from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from agent.nodes.planner import planner_node
+from agent.graph import get_task_state, plan_task
 from agent.reliability.chaos import get_chaos_middleware, set_chaos_mode as set_chaos_runtime_mode
-from agent.state import create_initial_state
 from routes.execute import start_background_execution
 from security import require_admin
-from services.redis_service import get_redis_service
 
 logger = logging.getLogger(__name__)
 
@@ -89,16 +87,12 @@ async def create_task(payload: TaskCreateRequest):
         return _error_response(status_code=400, message="Task must contain non-whitespace characters")
 
     task_id = str(uuid4())
-    state = create_initial_state(task_id=task_id, user_input=task_text)
 
     try:
-        planned_state = await planner_node(state)
+        # Runs the planner and pauses before any step executes (plan approval point).
+        planned_state = await plan_task(task_id, task_text)
         if str(planned_state.get("status") or "").lower() == "failed":
             return _error_response(status_code=500, message=_planner_error_message(planned_state))
-
-        planned_state["status"] = "planned"
-        redis = get_redis_service()
-        await redis.save_checkpoint(task_id, planned_state)
 
         steps = _serialize_steps(planned_state.get("steps") or [])
         return TaskCreateResponse(
@@ -115,8 +109,7 @@ async def create_task(payload: TaskCreateRequest):
 async def get_task(task_id: str):
     """Load task state from Redis checkpoint store."""
     try:
-        redis = get_redis_service()
-        state = await redis.load_checkpoint(task_id)
+        state = await get_task_state(task_id)
         if state is None:
             return _error_response(status_code=404, message=f"Task not found: {task_id}")
 
@@ -130,8 +123,7 @@ async def get_task(task_id: str):
 async def resume_task(task_id: str):
     """Resume task execution from latest checkpoint in background."""
     try:
-        redis = get_redis_service()
-        state = await redis.load_checkpoint(task_id)
+        state = await get_task_state(task_id)
         if state is None:
             return _error_response(status_code=404, message=f"Task not found: {task_id}")
 

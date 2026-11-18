@@ -108,11 +108,6 @@ def _result(
     }
 
 
-def execute_python_code(code: str, timeout_seconds: int = 10) -> dict[str, Any]:
-    """Execute model-written Python synchronously (blocking)."""
-    return _run_isolated(code, timeout_seconds)
-
-
 async def execute_code(code: str, language: str = "python", timeout: int = 10) -> ToolResult:
     """Execute model-written Python without blocking the event loop."""
     started = perf_counter()
@@ -128,4 +123,4 @@ async def execute_code(code: str, language: str = "python", timeout: int = 10) -
     )
 
 
-__all__ = ["code_exec_enabled", "execute_code", "execute_python_code"]
+__all__ = ["code_exec_enabled", "execute_code"]

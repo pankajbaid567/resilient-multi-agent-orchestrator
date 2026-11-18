@@ -1,9 +1,8 @@
-"""Reliability utilities for retries, fallback routing, checkpoints, and circuit breaking."""
+"""Reliability utilities: retries, model fallback, circuit breaking and chaos injection."""
 
 from .chaos import ChaosMiddleware, get_chaos_middleware, is_chaos_mode_enabled, set_chaos_mode
-from .checkpoint import CheckpointStore
 from .circuit_breaker import CircuitBreaker, CircuitBreakerManager, get_circuit_breaker_manager
-from .fallback import AllProvidersFailedError, FALLBACK_CHAIN, call_with_fallback, get_fallback_chain
+from .fallback import AllProvidersFailedError, call_with_fallback, default_chain, get_fallback_chain, provider_for_model
 from .retry import (
 	NON_RETRYABLE_EXCEPTIONS,
 	RETRYABLE_EXCEPTIONS,
@@ -14,12 +13,12 @@ from .retry import (
 )
 
 __all__ = [
-	"CheckpointStore",
 	"CircuitBreaker",
 	"CircuitBreakerManager",
 	"AllProvidersFailedError",
 	"ChaosMiddleware",
-	"FALLBACK_CHAIN",
+	"default_chain",
+	"provider_for_model",
 	"MaxRetriesExceededError",
 	"NON_RETRYABLE_EXCEPTIONS",
 	"RETRYABLE_EXCEPTIONS",

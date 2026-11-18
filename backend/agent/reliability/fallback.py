@@ -18,23 +18,22 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-FALLBACK_CHAIN = [
-    {
-        "provider": "open_source",
-        "model": "meta-llama/Llama-3.1-8B-Instruct",
-        "label": "Llama 3.1 8B",
-    },
-    {
-        "provider": "open_source",
-        "model": "Qwen/Qwen2.5-7B-Instruct",
-        "label": "Qwen 2.5 7B",
-    },
-    {
-        "provider": "open_source",
-        "model": "mistralai/Mistral-7B-Instruct-v0.3",
-        "label": "Mistral 7B",
-    },
-]
+def provider_for_model(model_name: str) -> str:
+    """Infer the provider client from a model name (OpenAI-compatible unless gpt-/claude-)."""
+    normalized = (model_name or "").strip().lower()
+    if normalized.startswith("claude"):
+        return "anthropic"
+    if normalized.startswith("gpt") and not get_settings().open_source_api_key:
+        return "openai"
+    return "open_source"
+
+
+def default_chain(preferred_model: str | None = None) -> list[dict]:
+    """Fallback chain from settings, with ``preferred_model`` (if any) tried first."""
+    models = get_settings().model_chain
+    if preferred_model:
+        models = [preferred_model, *[m for m in models if m != preferred_model]]
+    return [{"provider": provider_for_model(m), "model": m, "label": m.split("/")[-1]} for m in models]
 
 
 class AllProvidersFailedError(Exception):
@@ -47,8 +46,8 @@ class AllProvidersFailedError(Exception):
 
 
 def get_fallback_chain() -> list[str]:
-    """Return ordered model names for compatibility with existing callers."""
-    return [entry["model"] for entry in FALLBACK_CHAIN]
+    """Return ordered model names."""
+    return [entry["model"] for entry in default_chain()]
 
 
 async def call_with_fallback(
@@ -76,7 +75,7 @@ async def call_with_fallback(
 
     Returns LLMResponse with actual model/provider used
     """
-    chain = list(fallback_chain or FALLBACK_CHAIN)
+    chain = list(fallback_chain or default_chain())
     if not chain:
         raise AllProvidersFailedError(errors=[{"provider": "none", "error": "Fallback chain is empty"}])
 

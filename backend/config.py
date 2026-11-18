@@ -27,6 +27,12 @@ class Settings(BaseSettings):
     FALLBACK_MODEL_OPENAI: str | None = None
     FALLBACK_MODEL_ANTHROPIC: str | None = None
     VALIDATION_MODEL: str = "mistralai/Mistral-7B-Instruct-v0.3"
+    # Ordered models for fallback, comma-separated. Empty means PRIMARY_MODEL, FALLBACK_MODEL,
+    # VALIDATION_MODEL. Any OpenAI-compatible endpoint works via OPEN_SOURCE_BASE_URL (Hugging
+    # Face router, Gemini's OpenAI-compatible API, Groq, a local Ollama, ...).
+    MODEL_CHAIN: str = ""
+    # Some endpoints reject an explicit temperature for certain models; set false to omit it.
+    LLM_SEND_TEMPERATURE: bool = True
     MAX_RETRIES: int = 3
     STEP_TIMEOUT: int = 60
     MAX_STEPS: int = 15
@@ -43,6 +49,14 @@ class Settings(BaseSettings):
     # (0 disables the limit).
     TASK_TOKEN_BUDGET: int = 60_000
     TASK_DEADLINE_SECONDS: int = 600
+    # Multi-agent: "llm" lets the supervisor model pick the worker and write its brief;
+    # "rules" uses the planner's tool hint and keywords (no extra model call).
+    SUPERVISOR_MODE: str = "llm"
+    MAX_AGENT_TOOL_CALLS: int = 3
+    MAX_TOTAL_REFLECTIONS: int = 5
+    # Checkpointer for LangGraph state: "memory" (default), "sqlite:///path.db" or a
+    # postgresql:// URL (for example a free Neon database) for resume across restarts.
+    CHECKPOINT_URL: str = "memory"
     ENABLE_CODE_EXEC: bool = False
     ENABLE_API_CALL: bool = False
     ADMIN_API_KEY: str | None = None
@@ -89,6 +103,18 @@ class Settings(BaseSettings):
         """Backward-compatible alias for lowercase Redis URL access."""
 
         return self.REDIS_URL
+
+    @property
+    def model_chain(self) -> list[str]:
+        """Ordered, de-duplicated model names used for fallback."""
+        raw = [m.strip() for m in (self.MODEL_CHAIN or "").split(",") if m.strip()]
+        if not raw:
+            raw = [self.PRIMARY_MODEL, self.FALLBACK_MODEL, self.VALIDATION_MODEL]
+        chain: list[str] = []
+        for model in raw:
+            if model and model not in chain:
+                chain.append(model)
+        return chain
 
     @property
     def primary_model(self) -> str:

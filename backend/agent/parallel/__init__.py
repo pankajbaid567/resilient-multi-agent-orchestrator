@@ -1,6 +1,5 @@
-"""Parallel execution package exports."""
+"""Dependency graph utilities for planned steps."""
 
 from .dag import ExecutionDAG
-from .executor import ParallelExecutor
 
-__all__ = ["ExecutionDAG", "ParallelExecutor"]
+__all__ = ["ExecutionDAG"]

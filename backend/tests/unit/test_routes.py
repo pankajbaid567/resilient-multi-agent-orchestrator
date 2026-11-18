@@ -45,7 +45,7 @@ async def test_same_task_cannot_run_twice(monkeypatch):
 
 
 def test_agent_contributions_are_per_task():
-    from agent.multi_agent.coordinator import AgentCoordinator
+    from agent.graph import agent_contributions
     from agent.state import create_initial_state
     from models import StepResult
 
@@ -56,7 +56,16 @@ def test_agent_contributions_are_per_task():
                                             agent_role="analysis")]
         return state
 
-    a = AgentCoordinator.contributions_from_state(state_with("Research Agent", 10))
-    b = AgentCoordinator.contributions_from_state(state_with("Writing Agent", 20))
+    a = agent_contributions(state_with("Research Agent", 10))
+    b = agent_contributions(state_with("Writing Agent", 20))
     assert list(a) == ["Research Agent"] and list(b) == ["Writing Agent"]
     assert a["Research Agent"]["total_tokens"] == 10
+
+
+def test_create_plan_then_get_task(fake_llm):
+    client = _client()
+    created = client.post("/tasks", json={"task": "Summarise solar panel efficiency"}).json()
+    assert created["success"] and created["data"]["status"] == "planned"
+    task_id = created["data"]["task_id"]
+    state = client.get(f"/tasks/{task_id}").json()["data"]
+    assert state["status"] == "planned" and len(state["steps"]) == 2

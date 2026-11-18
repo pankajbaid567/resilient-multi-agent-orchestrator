@@ -222,66 +222,6 @@ def format_search_results(tool_result: ToolResult) -> str:
     return "\n".join(lines)
 
 
-def search_web(query: str, max_results: int = 5) -> dict[str, Any]:
-    """Backward-compatible sync wrapper used by legacy executor call-sites."""
-    started = perf_counter()
-    normalized_query = " ".join((query or "").strip().split())
-
-    tavily_api_key = _get_tavily_api_key()
-    if not tavily_api_key:
-        return {
-            "success": False,
-            "data": {"results": [], "query": normalized_query, "result_count": 0},
-            "error_message": "Tavily API key not configured",
-            "latency_ms": _latency_ms(started),
-            "tool_name": "web_search",
-        }
-
-    payload = {
-        "api_key": tavily_api_key,
-        "query": normalized_query,
-        "max_results": max(1, int(max_results)),
-        "search_depth": "basic",
-        "include_domains": [],
-        "exclude_domains": [],
-    }
-
-    try:
-        with httpx.Client(timeout=httpx.Timeout(DEFAULT_SEARCH_TIMEOUT_SECONDS)) as client:
-            response = client.post(TAVILY_SEARCH_URL, json=payload)
-            response.raise_for_status()
-            raw = response.json()
-    except httpx.TimeoutException:
-        return {
-            "success": False,
-            "data": {"results": [], "query": normalized_query, "result_count": 0},
-            "error_message": "Search timed out",
-            "latency_ms": _latency_ms(started),
-            "tool_name": "web_search",
-        }
-    except Exception as exc:
-        return {
-            "success": False,
-            "data": {"results": [], "query": normalized_query, "result_count": 0},
-            "error_message": str(exc),
-            "latency_ms": _latency_ms(started),
-            "tool_name": "web_search",
-        }
-
-    results = _normalize_tavily_results(raw, max_results=max_results)
-    return {
-        "success": True,
-        "data": {
-            "results": results,
-            "query": normalized_query,
-            "result_count": len(results),
-        },
-        "error_message": "",
-        "latency_ms": _latency_ms(started),
-        "tool_name": "web_search",
-    }
-
-
 def _get_tavily_api_key() -> str:
     """Best-effort retrieval of Tavily API key from settings."""
     try:
@@ -358,6 +298,5 @@ __all__ = [
     "ToolResult",
     "extract_search_query",
     "format_search_results",
-    "search_web",
     "web_search",
 ]
