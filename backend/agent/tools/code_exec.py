@@ -1,157 +1,131 @@
-"""Sandboxed subprocess code execution utilities for agent tool calls."""
+"""Python execution tool for agent steps.
+
+Off by default (ENABLE_CODE_EXEC=false). Model-written code is untrusted: on a public
+deployment it could read API keys or reach internal services. When an operator enables it,
+the child process gets an empty environment, Python isolated mode, a throwaway working
+directory, CPU/file/process limits and truncated output. This is a mitigation, not a
+sandbox: the child can still open network connections. Use a real sandbox (gVisor,
+Firecracker, E2B) before exposing it to untrusted users.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import subprocess
+import sys
+import tempfile
 from time import perf_counter
 from typing import Any
 
+from config import get_settings
+
 from .web_search import ToolResult
 
+MAX_OUTPUT_CHARS = 8_000
+DISABLED_MESSAGE = "code_exec is disabled on this deployment (ENABLE_CODE_EXEC=false)"
 
-async def execute_code(
-    code: str,
-    language: str = "python",
-    timeout: int = 10,
-) -> ToolResult:
-    """Execute code in a sandboxed subprocess."""
-    started = perf_counter()
-    normalized_language = str(language or "python").strip().lower()
 
-    if normalized_language not in {"python", "py"}:
-        return ToolResult(
-            success=False,
-            data={
-                "exit_code": None,
-                "stdout": "",
-                "stderr": "",
-                "language": normalized_language,
-                "network_access": "not_enforced",
-            },
-            error_message=f"Unsupported language: {language}",
-            latency_ms=_latency_ms(started),
-            tool_name="code_exec",
-        )
+def code_exec_enabled() -> bool:
+    """Return whether the operator has enabled model-written code execution."""
+    return bool(get_settings().ENABLE_CODE_EXEC)
 
+
+def _limit_resources(cpu_seconds: int) -> None:  # pragma: no cover - runs in the child process
+    """Apply POSIX resource limits in the child before exec."""
     try:
-        completed = await asyncio.to_thread(
-            subprocess.run,
-            ["python", "-c", code],
-            capture_output=True,
-            text=True,
-            timeout=int(timeout),
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return ToolResult(
-            success=False,
-            data={
-                "exit_code": None,
-                "stdout": exc.stdout or "",
-                "stderr": exc.stderr or "",
-                "language": "python",
-                "network_access": "not_enforced",
-            },
-            error_message=f"Execution timed out after {timeout} seconds",
-            latency_ms=_latency_ms(started),
-            tool_name="code_exec",
-        )
-    except Exception as exc:
-        return ToolResult(
-            success=False,
-            data={
-                "exit_code": None,
-                "stdout": "",
-                "stderr": "",
-                "language": "python",
-                "network_access": "not_enforced",
-            },
-            error_message=str(exc),
-            latency_ms=_latency_ms(started),
-            tool_name="code_exec",
-        )
+        import resource
 
-    payload = {
-        "exit_code": completed.returncode,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
-        "language": "python",
-        "network_access": "not_enforced",
-    }
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (1_000_000, 1_000_000))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+        if hasattr(resource, "RLIMIT_NPROC"):
+            resource.setrlimit(resource.RLIMIT_NPROC, (0, 0))
+    except Exception:
+        pass
+
+
+def _run_isolated(code: str, timeout_seconds: int) -> dict[str, Any]:
+    """Run code in a restricted child process and return a normalized payload."""
+    started = perf_counter()
+    if not code_exec_enabled():
+        return _result(False, "", "", None, DISABLED_MESSAGE, started)
+
+    with tempfile.TemporaryDirectory(prefix="agent-exec-") as workdir:
+        try:
+            completed = subprocess.run(  # noqa: S603 - fixed argv, code passed as one argument
+                [sys.executable, "-I", "-S", "-c", code],
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+                cwd=workdir,
+                env={"PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"},
+                preexec_fn=(lambda: _limit_resources(timeout_seconds)) if sys.platform != "win32" else None,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return _result(
+                False,
+                _as_text(exc.stdout),
+                _as_text(exc.stderr),
+                None,
+                f"Execution timed out after {timeout_seconds} seconds",
+                started,
+            )
+        except Exception as exc:  # pragma: no cover - OS-level spawn failure
+            return _result(False, "", "", None, str(exc), started)
 
     success = completed.returncode == 0
-    error_message = ""
-    if not success:
-        stderr = (completed.stderr or "").strip()
-        error_message = stderr if stderr else f"Process exited with code {completed.returncode}"
-
-    return ToolResult(
-        success=success,
-        data=payload,
-        error_message=error_message,
-        latency_ms=_latency_ms(started),
-        tool_name="code_exec",
-    )
+    stderr = completed.stderr or ""
+    error = "" if success else (stderr.strip() or f"Process exited with code {completed.returncode}")
+    return _result(success, completed.stdout or "", stderr, completed.returncode, error, started)
 
 
-def execute_python_code(code: str, timeout_seconds: int = 10) -> dict[str, Any]:
-    """Backward-compatible sync wrapper used by existing executor code paths."""
-    started = perf_counter()
-    try:
-        completed = subprocess.run(
-            ["python", "-c", code],
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "success": False,
-            "data": {
-                "stdout": exc.stdout or "",
-                "stderr": exc.stderr or "",
-                "return_code": None,
-                "network_access": "not_enforced",
-            },
-            "error_message": f"Execution timed out after {timeout_seconds} seconds",
-            "latency_ms": _latency_ms(started),
-            "tool_name": "code_exec",
-        }
-    except Exception as exc:
-        return {
-            "success": False,
-            "data": {
-                "stdout": "",
-                "stderr": "",
-                "return_code": None,
-                "network_access": "not_enforced",
-            },
-            "error_message": str(exc),
-            "latency_ms": _latency_ms(started),
-            "tool_name": "code_exec",
-        }
+def _as_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value or ""
 
+
+def _result(
+    success: bool,
+    stdout: str,
+    stderr: str,
+    return_code: int | None,
+    error_message: str,
+    started: float,
+) -> dict[str, Any]:
     return {
-        "success": completed.returncode == 0,
+        "success": success,
         "data": {
-            "stdout": completed.stdout,
-            "stderr": completed.stderr,
-            "return_code": completed.returncode,
-            "network_access": "not_enforced",
+            "stdout": stdout[:MAX_OUTPUT_CHARS],
+            "stderr": stderr[:MAX_OUTPUT_CHARS],
+            "return_code": return_code,
+            "network_access": "not_blocked",
         },
-        "error_message": ""
-        if completed.returncode == 0
-        else ((completed.stderr or "").strip() or f"Process exited with code {completed.returncode}"),
-        "latency_ms": _latency_ms(started),
+        "error_message": error_message,
+        "latency_ms": int((perf_counter() - started) * 1000),
         "tool_name": "code_exec",
     }
 
 
-def _latency_ms(started: float) -> int:
-    """Compute elapsed milliseconds from perf_counter start value."""
-    return int((perf_counter() - started) * 1000)
+def execute_python_code(code: str, timeout_seconds: int = 10) -> dict[str, Any]:
+    """Execute model-written Python synchronously (blocking)."""
+    return _run_isolated(code, timeout_seconds)
 
 
-__all__ = ["execute_code", "execute_python_code"]
+async def execute_code(code: str, language: str = "python", timeout: int = 10) -> ToolResult:
+    """Execute model-written Python without blocking the event loop."""
+    started = perf_counter()
+    if str(language or "python").strip().lower() not in {"python", "py"}:
+        return ToolResult(False, {}, f"Unsupported language: {language}", 0, "code_exec")
+    payload = await asyncio.to_thread(_run_isolated, code, int(timeout))
+    return ToolResult(
+        success=bool(payload["success"]),
+        data=payload["data"],
+        error_message=str(payload["error_message"]),
+        latency_ms=int((perf_counter() - started) * 1000),
+        tool_name="code_exec",
+    )
+
+
+__all__ = ["code_exec_enabled", "execute_code", "execute_python_code"]

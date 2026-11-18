@@ -8,7 +8,7 @@ import logging
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -16,6 +16,7 @@ from agent.graph import resume_agent
 from agent.nodes.planner import planner_node
 from agent.reliability.chaos import get_chaos_middleware, set_chaos_mode as set_chaos_runtime_mode
 from agent.state import create_initial_state
+from security import require_admin
 from services.redis_service import get_redis_service
 
 logger = logging.getLogger(__name__)
@@ -148,7 +149,7 @@ async def resume_task(task_id: str):
         return _error_response(status_code=500, message=str(exc))
 
 
-@config_router.post("/config/chaos", response_model=ChaosModeResponse)
+@config_router.post("/config/chaos", response_model=ChaosModeResponse, dependencies=[Depends(require_admin)])
 async def set_chaos_mode(payload: ChaosModeRequest):
     """Enable/disable chaos mode and return updated injection stats."""
     middleware = set_chaos_runtime_mode(bool(payload.enabled))

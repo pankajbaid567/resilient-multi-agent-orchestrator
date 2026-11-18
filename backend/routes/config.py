@@ -5,12 +5,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from agent.reliability.chaos import get_chaos_middleware, set_chaos_mode as set_chaos_runtime_mode
 from config import get_settings
+from security import require_admin
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +74,7 @@ async def get_runtime_config() -> RuntimeConfigResponse:
         return _error_response(status_code=500, message=str(exc))
 
 
-@router.post("/config", response_model=RuntimeConfigResponse)
+@router.post("/config", response_model=RuntimeConfigResponse, dependencies=[Depends(require_admin)])
 async def patch_runtime_config(payload: RuntimeConfigPatchRequest) -> RuntimeConfigResponse:
     """Patch one or more runtime settings in memory for subsequent task runs."""
     try:
@@ -96,7 +97,7 @@ async def get_chaos_mode() -> RuntimeConfigResponse:
         return _error_response(status_code=500, message=str(exc))
 
 
-@router.post("/config/chaos-mode", response_model=RuntimeConfigResponse)
+@router.post("/config/chaos-mode", response_model=RuntimeConfigResponse, dependencies=[Depends(require_admin)])
 async def set_chaos_mode(payload: EnabledRequest) -> RuntimeConfigResponse:
     """Compatibility endpoint for chaos mode updates from frontend fallback."""
     try:
@@ -109,7 +110,7 @@ async def set_chaos_mode(payload: EnabledRequest) -> RuntimeConfigResponse:
         return _error_response(status_code=500, message=str(exc))
 
 
-@router.post("/config/parallel", response_model=RuntimeConfigResponse)
+@router.post("/config/parallel", response_model=RuntimeConfigResponse, dependencies=[Depends(require_admin)])
 async def set_parallel_mode(payload: EnabledRequest) -> RuntimeConfigResponse:
     """Enable or disable parallel execution mode at runtime."""
     try:
@@ -121,7 +122,7 @@ async def set_parallel_mode(payload: EnabledRequest) -> RuntimeConfigResponse:
         return _error_response(status_code=500, message=str(exc))
 
 
-@router.post("/config/agents", response_model=RuntimeConfigResponse)
+@router.post("/config/agents", response_model=RuntimeConfigResponse, dependencies=[Depends(require_admin)])
 async def set_multi_agent_mode(payload: EnabledRequest) -> RuntimeConfigResponse:
     """Enable or disable specialized multi-agent routing at runtime."""
     try:
@@ -133,7 +134,7 @@ async def set_multi_agent_mode(payload: EnabledRequest) -> RuntimeConfigResponse
         return _error_response(status_code=500, message=str(exc))
 
 
-@router.post("/config/retries", response_model=RuntimeConfigResponse)
+@router.post("/config/retries", response_model=RuntimeConfigResponse, dependencies=[Depends(require_admin)])
 async def set_max_retries(payload: NumericValueRequest) -> RuntimeConfigResponse:
     """Update maximum retry count used by executor/reliability flow."""
     try:
@@ -145,7 +146,7 @@ async def set_max_retries(payload: NumericValueRequest) -> RuntimeConfigResponse
         return _error_response(status_code=500, message=str(exc))
 
 
-@router.post("/config/timeout", response_model=RuntimeConfigResponse)
+@router.post("/config/timeout", response_model=RuntimeConfigResponse, dependencies=[Depends(require_admin)])
 async def set_step_timeout(payload: NumericValueRequest) -> RuntimeConfigResponse:
     """Update per-step timeout used by executor/reliability flow."""
     try:
@@ -157,7 +158,7 @@ async def set_step_timeout(payload: NumericValueRequest) -> RuntimeConfigRespons
         return _error_response(status_code=500, message=str(exc))
 
 
-@router.post("/config/providers", response_model=RuntimeConfigResponse)
+@router.post("/config/providers", response_model=RuntimeConfigResponse, dependencies=[Depends(require_admin)])
 async def set_provider_chain(payload: ProvidersRequest) -> RuntimeConfigResponse:
     """Update frontend-visible provider fallback chain (runtime metadata only)."""
     try:

@@ -25,6 +25,11 @@ services:
         value: "0"
       - key: CHAOS_MODE
         value: "false"
+      # Server-side tools stay off on the public demo (see README, Security defaults)
+      - key: ENABLE_CODE_EXEC
+        value: "false"
+      - key: ENABLE_API_CALL
+        value: "false"
       - key: LOG_LEVEL
         value: "INFO"
       - key: OPEN_SOURCE_BASE_URL

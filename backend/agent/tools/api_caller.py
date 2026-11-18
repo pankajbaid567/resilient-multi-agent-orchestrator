@@ -7,18 +7,43 @@ from typing import Any
 
 import httpx
 
+from config import get_settings
+
+from .url_guard import BlockedURLError, check_public_url
 from .web_search import ToolResult
+
+DISABLED_MESSAGE = "api_call is disabled on this deployment (ENABLE_API_CALL=false)"
+MAX_BODY_CHARS = 8_000
+
+
+def api_call_enabled() -> bool:
+    """Return whether the operator has enabled outbound HTTP calls chosen by the model."""
+    return bool(get_settings().ENABLE_API_CALL)
+
+
+def _refusal(url: str, started: float) -> str | None:
+    """Return a reason to refuse the request, or None when it may proceed."""
+    if not api_call_enabled():
+        return DISABLED_MESSAGE
+    try:
+        check_public_url(url)
+    except BlockedURLError as exc:
+        return f"Blocked URL: {exc}"
+    return None
 
 
 async def call_api(
     url: str,
     method: str = "GET",
-    headers: dict = {},
-    body: dict = {},
+    headers: dict | None = None,
+    body: dict | None = None,
     timeout: int = 30,
 ) -> ToolResult:
     """Generic HTTP API caller using httpx."""
     started = perf_counter()
+    refusal = _refusal(str(url or ""), started)
+    if refusal:
+        return ToolResult(False, {}, refusal, _latency_ms(started), "api_caller")
 
     normalized_url = str(url or "").strip()
     if not normalized_url:
@@ -36,7 +61,7 @@ async def call_api(
 
     try:
         client_timeout = httpx.Timeout(float(timeout))
-        async with httpx.AsyncClient(timeout=client_timeout) as client:
+        async with httpx.AsyncClient(timeout=client_timeout, follow_redirects=False) as client:
             response = await client.request(
                 method=normalized_method,
                 url=normalized_url,
@@ -96,6 +121,9 @@ def call_api_sync(
 ) -> dict[str, Any]:
     """Backward-compatible sync API used by current executor call-sites."""
     started = perf_counter()
+    refusal = _refusal(str(url or ""), started)
+    if refusal:
+        return {"success": False, "data": {}, "error_message": refusal, "latency_ms": _latency_ms(started), "tool_name": "api_caller"}
     normalized_method = str(method or "GET").upper()
     normalized_url = str(url or "").strip()
 
@@ -109,7 +137,7 @@ def call_api_sync(
         }
 
     try:
-        with httpx.Client(timeout=timeout_seconds) as client:
+        with httpx.Client(timeout=timeout_seconds, follow_redirects=False) as client:
             response = client.request(
                 method=normalized_method,
                 url=normalized_url,
@@ -154,7 +182,7 @@ def _parse_body(response: httpx.Response) -> Any:
     try:
         return response.json()
     except ValueError:
-        return response.text
+        return response.text[:MAX_BODY_CHARS]
 
 
 def _latency_ms(started: float) -> int:

@@ -481,6 +481,11 @@ def _normalize_tool_needed(value: Any) -> str:
     """Normalize tool labels into the supported planner tool set."""
     normalized = str(value or "").strip().lower()
     allowed = {"web_search", "api_call", "code_exec", "llm_only", "none"}
+    settings = get_settings()
+    if normalized == "code_exec" and not settings.ENABLE_CODE_EXEC:
+        return "llm_only"
+    if normalized == "api_call" and not settings.ENABLE_API_CALL:
+        return "llm_only"
     if normalized in allowed:
         return normalized
     if normalized in {"llm", "llm-call", "language_model"}:

@@ -1,14 +1,13 @@
 # Reliable AI Agent: Multi-Step Task Execution Under Uncertainty
 
-![Build](https://img.shields.io/badge/Build-Passing-brightgreen)
 ![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)
 ![React](https://img.shields.io/badge/React-18-61DAFB.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 ![Docker Compose](https://img.shields.io/badge/Deploy-Docker%20Compose-2496ED?logo=docker&logoColor=white)
 
-Reliable AI Agent is an enterprise-grade orchestration platform designed to plan, execute, validate, and self-correct complex multi-step AI tasks. Built around a robust Directed Acyclic Graph (DAG) state machine, the system treats AI generation as an auditable, resilient runtime. 
+Reliable AI Agent is a LangGraph-based agent that plans, executes, validates and self-corrects multi-step tasks. Built around a robust Directed Acyclic Graph (DAG) state machine, the system treats AI generation as an auditable, resilient runtime. 
 
-Unlike simple prompt-and-response interfaces, this platform guarantees execution reliability by employing parallel task execution, specialized multi-agent roles, circuit breakers, and automatic failover using an open-source model stack.
+Instead of a single prompt and response, it aims to make multi-step runs survive provider and quality failures using parallel task execution, specialized multi-agent roles, circuit breakers, and automatic failover using an open-source model stack.
 
 ## Key Differentiators
 
@@ -16,8 +15,19 @@ Unlike simple prompt-and-response interfaces, this platform guarantees execution
 *   **Specialized Multi-Agent Routing:** Dynamically delegates steps to specialized agent roles (Research, Code, Analysis, Writing), each optimized with specific system prompts and models.
 *   **Open-Source First:** Fully configured to leverage leading open-source models (Llama 3.1, Qwen 2.5, Mistral 7B) through a scalable fallback chain.
 *   **Self-Healing Architecture:** Built-in validation nodes assess output quality, triggering automated reflection and retry loops for subpar results.
-*   **Resiliency Patterns:** Implements production-grade circuit breakers, exponential backoffs, and deterministic state checkpointing via Redis.
+*   **Resiliency Patterns:** Circuit breakers, exponential backoff with jitter, and state checkpointing via Redis.
 *   **Real-time Observability:** A React/Vite dashboard provides deep telemetry, visualizing the execution DAG, live logs, and trace waterfalls.
+
+## Security defaults
+
+Two tools act on the server's behalf, so both are **off unless an operator enables them**:
+
+| Switch | Default | What it allows | Guard when enabled |
+|---|---|---|---|
+| `ENABLE_CODE_EXEC` | `false` | runs model-written Python | empty environment (no API keys), isolated mode, temp dir, CPU/file/process limits, truncated output. **Network is not blocked; this is not a sandbox.** |
+| `ENABLE_API_CALL` | `false` | GET requests to URLs the model chose | http(s) only, every resolved address must be public (blocks loopback, private, link-local/cloud metadata), no redirects |
+
+Endpoints that change process-wide settings (`POST /config*`, chaos mode) need an `X-Admin-Key` header matching `ADMIN_API_KEY`; with no key configured they are refused, so a public deployment is read-only.
 
 ## System Architecture
 

@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     OPEN_SOURCE_BASE_URL: str = "https://router.huggingface.co/v1"
     OPENAI_API_KEY: str | None = None
     ANTHROPIC_API_KEY: str | None = None
-    TAVILY_API_KEY: str
+    TAVILY_API_KEY: str | None = None
     REDIS_URL: str = "redis://localhost:6379"
     PRIMARY_MODEL: str = "meta-llama/Llama-3.1-8B-Instruct"
     FALLBACK_MODEL: str = "Qwen/Qwen2.5-7B-Instruct"
@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     CHAOS_MODE: bool = False
     LOG_LEVEL: str = "INFO"
     CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
+    # Security switches. Both tools act on the server's behalf, so they are off unless an
+    # operator turns them on for a trusted, private deployment.
+    ENABLE_CODE_EXEC: bool = False
+    ENABLE_API_CALL: bool = False
+    ADMIN_API_KEY: str | None = None
 
     class Config:
         """Pydantic configuration for environment-based settings loading."""
@@ -73,7 +78,7 @@ class Settings(BaseSettings):
     def tavily_api_key(self) -> str:
         """Backward-compatible alias for lowercase Tavily API key access."""
 
-        return self.TAVILY_API_KEY
+        return (self.TAVILY_API_KEY or "").strip()
 
     @property
     def redis_url(self) -> str:
