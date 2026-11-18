@@ -9,6 +9,7 @@ from time import perf_counter
 from typing import Any
 
 from anthropic import AsyncAnthropic
+from opentelemetry import trace
 from openai import AsyncOpenAI
 
 from config import get_settings
@@ -59,6 +60,12 @@ class LLMResponse:
     provider: str
     input_tokens: int = 0
     output_tokens: int = 0
+    finish_reason: str = ""
+
+    @property
+    def truncated(self) -> bool:
+        """True when the provider stopped because of the token limit (the answer is cut off)."""
+        return self.finish_reason in {"length", "max_tokens"}
 
 
 def get_openai_client() -> AsyncOpenAI:
@@ -109,6 +116,29 @@ async def call_llm(
     """
     normalized_provider = provider.strip().lower()
     model = model or get_settings().primary_model
+    with trace.get_tracer("reliable-agent").start_as_current_span(
+        f"chat {model}", kind=trace.SpanKind.CLIENT,
+        attributes={"gen_ai.operation.name": "chat", "gen_ai.system": normalized_provider,
+                    "gen_ai.request.model": model, "gen_ai.request.max_tokens": max_tokens,
+                    "gen_ai.request.temperature": temperature},
+    ) as span:
+        response = await _call_llm_inner(prompt, system_prompt, model, normalized_provider, provider,
+                                         temperature, max_tokens, json_mode, timeout, span)
+    return response
+
+
+async def _call_llm_inner(
+    prompt: str,
+    system_prompt: str,
+    model: str,
+    normalized_provider: str,
+    provider: str,
+    temperature: float,
+    max_tokens: int,
+    json_mode: bool,
+    timeout: int,
+    span: Any,
+) -> LLMResponse:
     started = perf_counter()
 
     if normalized_provider not in {"openai", "anthropic", "open_source"}:
@@ -130,6 +160,7 @@ async def call_llm(
             text = _extract_openai_text(response)
             tokens_used = _extract_openai_tokens(response)
             input_tokens, output_tokens = _usage_split(response, "prompt_tokens", "completion_tokens")
+            finish_reason = str(getattr((getattr(response, "choices", None) or [None])[0], "finish_reason", "") or "")
             model_used = str(getattr(response, "model", model) or model)
         else:
             response = await _call_anthropic(
@@ -144,6 +175,7 @@ async def call_llm(
             text = _extract_anthropic_text(response)
             tokens_used = _extract_anthropic_tokens(response)
             input_tokens, output_tokens = _usage_split(response, "input_tokens", "output_tokens")
+            finish_reason = str(getattr(response, "stop_reason", "") or "")
             model_used = str(getattr(response, "model", model) or model)
 
         if not text.strip():
@@ -151,6 +183,8 @@ async def call_llm(
 
         latency_ms = int((perf_counter() - started) * 1000)
         record_llm_call(model_used, normalized_provider, input_tokens, output_tokens, latency_ms, ok=True)
+        span.set_attributes({"gen_ai.response.model": model_used, "gen_ai.usage.input_tokens": input_tokens,
+                             "gen_ai.usage.output_tokens": output_tokens})
         logger.info(
             "llm_call_success provider=%s model=%s tokens=%s latency_ms=%s",
             normalized_provider,
@@ -166,10 +200,12 @@ async def call_llm(
             provider=normalized_provider,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            finish_reason=finish_reason,
         )
     except LLMError as exc:
         latency_ms = int((perf_counter() - started) * 1000)
         record_llm_call(model, normalized_provider, 0, 0, latency_ms, ok=False, error=type(exc).__name__)
+        span.set_status(trace.Status(trace.StatusCode.ERROR, type(exc).__name__))
         logger.warning(
             "llm_call_failed provider=%s model=%s tokens=%s latency_ms=%s",
             normalized_provider,
@@ -182,6 +218,7 @@ async def call_llm(
         mapped_error = _map_provider_error(exc, provider=normalized_provider, model=model)
         latency_ms = int((perf_counter() - started) * 1000)
         record_llm_call(model, normalized_provider, 0, 0, latency_ms, ok=False, error=type(mapped_error).__name__)
+        span.set_status(trace.Status(trace.StatusCode.ERROR, type(mapped_error).__name__))
         logger.warning(
             "llm_call_failed provider=%s model=%s tokens=%s latency_ms=%s error=%s",
             normalized_provider,

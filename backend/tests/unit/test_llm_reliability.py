@@ -175,3 +175,23 @@ async def test_temperature_can_be_omitted(monkeypatch, settings):
     with pytest.raises(LLMTimeoutError):
         await call_llm("hi", timeout=1)
     assert "temperature" not in sent
+
+
+async def test_every_role_survives_a_primary_model_outage(fake_llm, settings, monkeypatch):
+    """Planner, supervisor, judge and finalizer must fall back too, not only workers."""
+    from agent.graph import run_agent
+
+    settings.MODEL_CHAIN = "primary-model,backup-model"
+    original = fake_llm.call_openai
+
+    async def primary_down(**kwargs):
+        if kwargs["model"] == "primary-model":
+            raise provider_error(503)
+        return await original(**kwargs)
+
+    monkeypatch.setattr("services.llm_service._call_openai", primary_down)
+    final = await run_agent("outage", "Summarise solar panel efficiency")
+    assert final["status"] == "completed"
+    assert final["final_output"]["summary"]["outcome"] == "complete"
+    assert "primary-model" not in {c["model"] for c in final["llm_calls"] if c["ok"]}
+    assert {c["node"] for c in final["llm_calls"] if c["model"] == "backup-model" and c["ok"]} >= {"planner", "execute", "finalizer"}

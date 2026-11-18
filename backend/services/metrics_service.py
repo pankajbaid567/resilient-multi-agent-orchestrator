@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional
 
 from agent.state import AgentState
 from models import AggregateMetrics, TaskMetrics, TraceSummary
+from services.llm_metrics import summarize_llm_calls
 
 MODEL_COST_RATES_USD_PER_MILLION = {
     "gpt-4o": {"input": 2.50, "output": 10.00},
@@ -68,11 +69,17 @@ class MetricsService:
         )
 
         llm_tokens_used = max(0, self._to_int(state_data.get("llm_tokens_used")))
-        tokens_input, tokens_output = self._compute_token_breakdown(
-            trace=trace,
-            step_results=step_results,
-            llm_tokens_used=llm_tokens_used,
-        )
+        llm_calls = self._as_list(state_data.get("llm_calls"))
+        llm_usage = summarize_llm_calls(llm_calls) if llm_calls else None
+        if llm_usage is not None:
+            tokens_input, tokens_output = llm_usage["input_tokens"], llm_usage["output_tokens"]
+            fallback_count = max(fallback_count, llm_usage["fallbacks"])
+        else:
+            tokens_input, tokens_output = self._compute_token_breakdown(
+                trace=trace,
+                step_results=step_results,
+                llm_tokens_used=llm_tokens_used,
+            )
         total_tokens = tokens_input + tokens_output
 
         models_used = self._collect_models_used(step_results=step_results, trace=trace)
@@ -85,11 +92,14 @@ class MetricsService:
         failure_types = self._collect_failure_types(error_log=error_log, step_results=step_results)
         reflection_strategies = self._collect_reflection_strategies(trace=trace)
 
-        estimated_cost_usd = self._estimate_cost_usd(
-            step_results=step_results,
-            trace=trace,
-            fallback_total_tokens=total_tokens,
-        )
+        if llm_usage is not None:
+            estimated_cost_usd = float(llm_usage["cost_usd"] or 0.0)
+        else:
+            estimated_cost_usd = self._estimate_cost_usd(
+                step_results=step_results,
+                trace=trace,
+                fallback_total_tokens=total_tokens,
+            )
 
         time_saved_parallel_ms = self._estimate_parallel_time_saved(
             state_data=state_data,
@@ -101,6 +111,7 @@ class MetricsService:
         return TaskMetrics(
             task_id=task_id,
             status=status,
+            llm_usage=llm_usage,
             total_steps=total_steps,
             successful_steps=successful_steps,
             failed_steps=failed_steps,

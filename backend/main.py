@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from agent.graph import init_graph
+from agent.telemetry import init_telemetry
 from config import get_settings
 from routes import chaos_config_router, config_router, execute_router, metrics_router, tasks_router, traces_router
 from services import close_redis_client, get_redis_client
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Initialize application resources and validate Redis reachability at startup, and close on shutdown."""
     logger.info("Agent API starting...")
+    init_telemetry()
     stack = AsyncExitStack()
     await init_graph(stack)
     try:

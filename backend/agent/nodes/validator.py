@@ -9,7 +9,8 @@ import re
 from typing import Any
 
 from config import get_settings
-from services.llm_service import LLMError, call_llm
+from agent.reliability.fallback import complete
+from services.llm_service import LLMError
 
 logger = logging.getLogger(__name__)
 
@@ -104,17 +105,15 @@ async def judge_output(step_name: str, step_description: str, output: str) -> Ju
         return Judgement("retry", f"Output is too short ({len(text)} characters) to complete the step.", {},
                          "deterministic")
 
-    model_name = _get_validation_model()
     try:
-        response = await call_llm(
+        response = await complete(
+            preferred_model=_get_validation_model(),
             prompt=VALIDATOR_USER_PROMPT_TEMPLATE.format(
                 step_name=step_name,
                 step_description=step_description,
                 step_output=text[:MAX_JUDGED_OUTPUT_CHARS],
             ),
             system_prompt=VALIDATOR_SYSTEM_PROMPT,
-            model=model_name,
-            provider=_provider_for_model(model_name),
             temperature=0.1,
             max_tokens=400,
             json_mode=True,
@@ -231,12 +230,3 @@ def _get_validation_model() -> str:
         return configured.strip()
     return settings.primary_model
 
-
-def _provider_for_model(model_name: str) -> str:
-    """Infer provider label from model naming while preferring open-source routing."""
-    normalized = model_name.strip().lower()
-    if normalized.startswith("claude"):
-        return "anthropic"
-    if normalized.startswith("gpt"):
-        return "openai"
-    return "open_source"

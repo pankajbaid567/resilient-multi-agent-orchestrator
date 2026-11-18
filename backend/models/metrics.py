@@ -34,6 +34,10 @@ class TaskMetrics(BaseModel):
     time_saved_parallel_ms: Optional[int] = Field(default=None, ge=0)
     failure_types: Dict[str, int] = Field(default_factory=dict)
     reflection_strategies: Dict[str, int] = Field(default_factory=dict)
+    llm_usage: Optional[dict] = Field(
+        default=None,
+        description="Per-call LLM metrics: tokens in/out, latency p50/p95, tokens/s, fallbacks, cost (if priced).",
+    )
 
 
 class AggregateMetrics(BaseModel):

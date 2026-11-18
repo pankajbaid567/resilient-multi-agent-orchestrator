@@ -8,7 +8,8 @@ import logging
 from typing import TYPE_CHECKING, Any, List, Optional
 
 from config import get_settings
-from services.llm_service import LLMResponse, call_llm
+from services.usage import record_llm_call
+from services.llm_service import LLMConnectionError, LLMResponse, call_llm
 
 from .chaos import get_chaos_middleware
 from .retry import NON_RETRYABLE_EXCEPTIONS, RETRYABLE_EXCEPTIONS, retry_with_backoff
@@ -97,7 +98,7 @@ async def call_with_fallback(
 
         logger.info("%sTrying provider %s (%s)", context, provider_key, label)
 
-        if circuit_breaker is not None:
+        if circuit_breaker is not None and get_settings().ENABLE_CIRCUIT_BREAKER:
             is_open = await _circuit_is_open(circuit_breaker, provider_key)
             if is_open:
                 reason = f"Circuit open for provider {provider_key}"
@@ -113,7 +114,13 @@ async def call_with_fallback(
             if chaos_mode_enabled:
                 chaos = get_chaos_middleware()
                 chaos.enabled = True
-                injection = await chaos.maybe_inject(f"provider={provider}, step={step_id or 'unknown'}")
+                try:
+                    injection = await chaos.maybe_inject(f"provider={provider}, step={step_id or 'unknown'}")
+                except Exception as injected:
+                    # Record injected failures like real ones so usage metrics show them.
+                    record_llm_call(model, provider, 0, 0, 0, ok=False,
+                                    error=f"chaos_{getattr(injected, 'injection_type', 'unknown')}")
+                    raise
             response = await call_llm(
                 prompt=prompt,
                 system_prompt=system_prompt,
@@ -125,7 +132,9 @@ async def call_with_fallback(
                 timeout=timeout,
             )
             if injection == "CORRUPT":
+                # Simulates a response cut off mid-way (as when the token limit is hit).
                 response.text = response.text[: len(response.text) // 2]
+                response.finish_reason = "length"
             return response
 
         try:
@@ -244,3 +253,39 @@ def _extract_chaos_tag(error: Exception | None) -> str | None:
 
     injection_type = str(getattr(error, "injection_type", "")).strip().lower()
     return injection_type or "unknown"
+
+
+async def complete(
+    prompt: str,
+    system_prompt: str,
+    *,
+    preferred_model: str | None = None,
+    json_mode: bool = False,
+    temperature: float = 0.7,
+    max_tokens: int = 1024,
+    timeout: int = 60,
+    task_id: Optional[str] = None,
+    step_id: Optional[str] = None,
+) -> LLMResponse:
+    """One model call for any role, with retry, model fallback and circuit breaking.
+
+    Raises LLMConnectionError (an LLMError) when every model in the chain failed, so
+    callers can keep a single ``except LLMError`` path.
+    """
+    from .circuit_breaker import get_circuit_breaker_manager
+
+    try:
+        return await call_with_fallback(
+            prompt=prompt,
+            system_prompt=system_prompt,
+            json_mode=json_mode,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            task_id=task_id,
+            step_id=step_id,
+            fallback_chain=default_chain(preferred_model),
+            circuit_breaker=get_circuit_breaker_manager(),
+        )
+    except AllProvidersFailedError as exc:
+        raise LLMConnectionError(str(exc)) from exc

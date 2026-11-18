@@ -31,7 +31,9 @@ from agent.nodes.planner import planner_node
 from agent.parallel.dag import ExecutionDAG
 from agent.state import AgentState, create_initial_state, final_results_by_step
 from agent.step_graph import run_step
+from agent.telemetry import tracer
 from config import get_settings
+from services.llm_metrics import summarize_llm_calls
 from services.usage import total_tokens, usage_scope
 
 logger = logging.getLogger(__name__)
@@ -104,7 +106,8 @@ def _deadline_at(state: AgentState) -> datetime | None:
 
 async def planner(state: AgentState) -> dict[str, Any]:
     started = await emit(state["task_id"], trace("task_started", details={"status": "planning"}))
-    delta = await _as_delta(planner_node, state, NODE_PLANNER)
+    with tracer().start_as_current_span("node planner"):
+        delta = await _as_delta(planner_node, state, NODE_PLANNER)
     delta["execution_trace"] = [started, *delta.get("execution_trace", [])]
     steps = delta.get("steps") or state.get("steps") or []
     if delta.get("status") == "failed" or not steps:
@@ -162,7 +165,15 @@ def dispatch(state: AgentState) -> list[Send] | str:
 
 
 async def step_worker(payload: dict[str, Any]) -> dict[str, Any]:
-    return await run_step(payload)
+    step = payload["step"]
+    with tracer().start_as_current_span(f"step {step.step_id}", attributes={"step.id": step.step_id,
+                                                                            "step.name": step.name}) as span:
+        delta = await run_step(payload)
+        results = delta.get("step_results") or []
+        if results:
+            span.set_attributes({"step.status": results[-1].status, "agent.name": results[-1].agent_name or "",
+                                 "step.tokens": int(delta.get("llm_tokens_used") or 0)})
+        return delta
 
 
 async def budget_stop(state: AgentState) -> dict[str, Any]:
@@ -191,15 +202,23 @@ def agent_contributions(state: AgentState) -> dict[str, dict]:
 
 
 async def finalizer(state: AgentState) -> dict[str, Any]:
-    delta = await _as_delta(finalizer_node, state, NODE_FINALIZER)
+    with tracer().start_as_current_span("node finalizer"):
+        delta = await _as_delta(finalizer_node, state, NODE_FINALIZER)
     total = _safe_int(state.get("llm_tokens_used")) + delta["llm_tokens_used"]
     final_output = delta.get("final_output") or state.get("final_output") or {}
     summary = final_output.get("summary") or {}
+    usage = summarize_llm_calls([*(state.get("llm_calls") or []), *delta["llm_calls"]])
     summary["total_tokens"] = total
-    summary["llm_calls"] = len(state.get("llm_calls") or []) + len(delta["llm_calls"])
+    summary["llm_calls"] = usage["calls"]
+    summary["llm_usage"] = usage
+    summary["estimated_cost_usd"] = usage["cost_usd"]
     if state.get("abort_reason"):
         delta["status"] = "failed"
         summary["abort_reason"] = state["abort_reason"]
+    if not state.get("steps") or state.get("status") == "failed":
+        # Planning failed (or the run failed before any step): nothing was produced.
+        delta["status"] = "failed"
+        summary["outcome"] = "failed"
     final_output["summary"] = summary
     delta["final_output"] = final_output
     delta["agent_contributions"] = agent_contributions(state)
@@ -256,7 +275,8 @@ def _config(task_id: str) -> dict[str, Any]:
 async def plan_task(task_id: str, user_input: str) -> dict[str, Any]:
     """Run the planner and pause; returns the state with the proposed steps."""
     graph = get_graph()
-    await graph.ainvoke(create_initial_state(task_id, user_input), config=_config(task_id))
+    with tracer().start_as_current_span("task.plan", attributes={"task.id": task_id}):
+        await graph.ainvoke(create_initial_state(task_id, user_input), config=_config(task_id))
     return (await graph.aget_state(_config(task_id))).values
 
 
@@ -267,7 +287,11 @@ async def continue_task(task_id: str) -> dict[str, Any]:
     if not snapshot.values:
         raise ValueError(f"No saved state for task {task_id}")
     if snapshot.next:
-        await graph.ainvoke(None, config=_config(task_id))
+        with tracer().start_as_current_span("task.execute", attributes={"task.id": task_id}) as span:
+            await graph.ainvoke(None, config=_config(task_id))
+            final = (await graph.aget_state(_config(task_id))).values
+            span.set_attributes({"task.status": str(final.get("status")),
+                                 "task.tokens": int(final.get("llm_tokens_used") or 0)})
     return (await graph.aget_state(_config(task_id))).values
 
 

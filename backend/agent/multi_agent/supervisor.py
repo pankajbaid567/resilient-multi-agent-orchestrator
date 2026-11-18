@@ -15,7 +15,8 @@ from typing import Optional
 
 from config import get_settings
 from models import StepDefinition
-from services.llm_service import LLMError, call_llm
+from agent.reliability.fallback import complete
+from services.llm_service import LLMError
 
 from .agents import AGENT_REGISTRY, ANALYSIS_AGENT
 
@@ -108,10 +109,9 @@ async def delegate(step: StepDefinition, original_input: str, context: str = "")
         '"reason": "<one sentence>"}'
     )
     try:
-        response = await call_llm(
+        response = await complete(
             prompt=prompt,
             system_prompt=SUPERVISOR_SYSTEM_PROMPT,
-            model=get_settings().primary_model,
             temperature=0.0,
             max_tokens=300,
             json_mode=True,

@@ -1,0 +1,40 @@
+{"id": "t01", "category": "comparison", "task": "Compare solar panels and wind turbines for powering a small village in Rajasthan, and recommend one.", "rubric": ["cost", "maintenance", "recommendation"]}
+{"id": "t02", "category": "comparison", "task": "Compare PostgreSQL and MongoDB for an e-commerce order system and recommend one.", "rubric": ["transactions", "schema", "recommendation"]}
+{"id": "t03", "category": "comparison", "task": "Compare learning Rust versus Go as a second language for a backend engineer.", "rubric": ["concurrency", "learning curve", "recommendation"]}
+{"id": "t04", "category": "comparison", "task": "Compare renting versus buying a flat in Bengaluru for a 26-year-old engineer.", "rubric": ["EMI", "flexibility", "recommendation"]}
+{"id": "t05", "category": "comparison", "task": "Compare electric scooters and petrol scooters for daily 20 km commutes in Pune.", "rubric": ["running cost", "charging", "recommendation"]}
+{"id": "t06", "category": "comparison", "task": "Compare REST and gRPC for communication between internal microservices.", "rubric": ["performance", "tooling", "recommendation"]}
+{"id": "t07", "category": "comparison", "task": "Compare index funds and fixed deposits for a five-year savings goal.", "rubric": ["return", "risk", "recommendation"]}
+{"id": "t08", "category": "comparison", "task": "Compare Kafka and RabbitMQ for an order-events pipeline.", "rubric": ["ordering", "throughput", "recommendation"]}
+{"id": "t09", "category": "explanation", "task": "Explain how a circuit breaker protects a service from a failing dependency, with an example.", "rubric": ["closed", "open", "half-open"]}
+{"id": "t10", "category": "explanation", "task": "Explain retrieval-augmented generation to a product manager, including its main failure modes.", "rubric": ["retrieval", "hallucination", "citations"]}
+{"id": "t11", "category": "explanation", "task": "Explain how HTTPS establishes a secure connection, step by step.", "rubric": ["certificate", "key exchange", "encryption"]}
+{"id": "t12", "category": "explanation", "task": "Explain database indexing and when an index makes queries slower.", "rubric": ["B-tree", "writes", "selectivity"]}
+{"id": "t13", "category": "explanation", "task": "Explain the CAP theorem with one concrete example per trade-off.", "rubric": ["consistency", "availability", "partition"]}
+{"id": "t14", "category": "explanation", "task": "Explain how UPI payments move money between two bank accounts.", "rubric": ["VPA", "NPCI", "settlement"]}
+{"id": "t15", "category": "explanation", "task": "Explain what an LLM token is and why cost is billed per token.", "rubric": ["tokenizer", "input", "output"]}
+{"id": "t16", "category": "explanation", "task": "Explain exponential backoff with jitter and why jitter matters.", "rubric": ["retry", "thundering herd", "delay"]}
+{"id": "t17", "category": "planning", "task": "Plan a two-week study schedule to prepare for a DSA-heavy internship interview.", "rubric": ["schedule", "topics", "practice"]}
+{"id": "t18", "category": "planning", "task": "Plan the launch of a college tech fest website in four weeks.", "rubric": ["timeline", "owners", "risks"]}
+{"id": "t19", "category": "planning", "task": "Plan a migration of a monolith's user service into a separate microservice.", "rubric": ["phases", "data migration", "rollback"]}
+{"id": "t20", "category": "planning", "task": "Plan a weekend trip from Delhi to Rishikesh for four friends on a budget.", "rubric": ["travel", "stay", "budget"]}
+{"id": "t21", "category": "planning", "task": "Plan an evaluation for a customer-support chatbot before launch.", "rubric": ["test set", "metrics", "failure cases"]}
+{"id": "t22", "category": "planning", "task": "Plan how to add rate limiting to a public REST API.", "rubric": ["algorithm", "limits", "headers"]}
+{"id": "t23", "category": "planning", "task": "Plan a 30-day habit to get fitter with a desk job.", "rubric": ["exercise", "diet", "tracking"]}
+{"id": "t24", "category": "planning", "task": "Plan the on-call runbook for a payment service outage.", "rubric": ["detection", "escalation", "communication"]}
+{"id": "t25", "category": "analysis", "task": "Analyse the risks of letting an AI agent execute code on a production server.", "rubric": ["sandbox", "secrets", "network"]}
+{"id": "t26", "category": "analysis", "task": "Analyse why a web page might load slowly and how to diagnose each cause.", "rubric": ["network", "rendering", "caching"]}
+{"id": "t27", "category": "analysis", "task": "Analyse the trade-offs of caching LLM responses in a chatbot.", "rubric": ["staleness", "cost", "personalisation"]}
+{"id": "t28", "category": "analysis", "task": "Analyse what could make a mobile app's crash rate spike after a release.", "rubric": ["release", "device", "rollback"]}
+{"id": "t29", "category": "analysis", "task": "Analyse the pros and cons of a four-day work week for a 50-person startup.", "rubric": ["productivity", "cost", "morale"]}
+{"id": "t30", "category": "analysis", "task": "Analyse how a food delivery app could reduce late deliveries.", "rubric": ["dispatch", "prep time", "traffic"]}
+{"id": "t31", "category": "analysis", "task": "Analyse failure modes of a nightly batch job that imports bank statements.", "rubric": ["partial failure", "idempotency", "alerting"]}
+{"id": "t32", "category": "analysis", "task": "Analyse whether a small team should self-host Postgres or use a managed service.", "rubric": ["operations", "cost", "backups"]}
+{"id": "t33", "category": "writing", "task": "Write a short project update email explaining a one-week delay to stakeholders.", "rubric": ["delay", "reason", "new date"]}
+{"id": "t34", "category": "writing", "task": "Write a README introduction for an open-source CLI that converts CSV to JSON.", "rubric": ["install", "usage", "example"]}
+{"id": "t35", "category": "writing", "task": "Write a blameless post-mortem summary for a 40-minute API outage caused by a bad config.", "rubric": ["timeline", "root cause", "action items"]}
+{"id": "t36", "category": "writing", "task": "Write a polite message asking a professor for a recommendation letter.", "rubric": ["request", "context", "deadline"]}
+{"id": "t37", "category": "writing", "task": "Write release notes for a version that adds dark mode and fixes two login bugs.", "rubric": ["dark mode", "fixes", "upgrade"]}
+{"id": "t38", "category": "writing", "task": "Write a one-page explanation of a new leave policy for employees.", "rubric": ["eligibility", "process", "examples"]}
+{"id": "t39", "category": "writing", "task": "Write a product description for a reusable steel water bottle aimed at students.", "rubric": ["features", "benefits", "price"]}
+{"id": "t40", "category": "writing", "task": "Write interview questions to assess a candidate's debugging skills.", "rubric": ["scenario", "follow-up", "signals"]}

@@ -67,6 +67,7 @@ class StepState(TypedDict, total=False):
     verdict_reason: Optional[str]
     abort_reason: Optional[str]
     reflection_action: Optional[str]
+    last_truncated: bool
     # Delta for the parent graph
     step_results: Annotated[List[StepResult], operator.add]
     execution_trace: Annotated[List[dict], operator.add]
@@ -136,6 +137,7 @@ async def execute_node(state: StepState) -> dict[str, Any]:
     spent = total_tokens(calls)
     delta["llm_calls"] = calls
     delta["llm_tokens_used"] = spent
+    delta["last_truncated"] = result.truncated
     delta["agent_messages"].append({"timestamp": _now(), "step_id": step.step_id, "sender": agent.role,
                                     "recipient": "supervisor", "kind": "result" if result.ok else "failure",
                                     "content": (result.output or result.error or "")[:500],
@@ -167,6 +169,9 @@ async def validate_node(state: StepState) -> dict[str, Any]:
     with usage_scope(node="validate", step_id=step.step_id) as calls:
         if result.status != "success":
             verdict, reason, scores, source = "retry", f"No usable output: {result.error or 'empty'}", {}, "deterministic"
+        elif state.get("last_truncated"):
+            verdict, reason, scores, source = ("retry", "The answer was cut off by the token limit; give a complete, "
+                                               "more concise answer.", {}, "deterministic")
         else:
             judgement = await judge_output(step.name, step.description, result.output)
             verdict, reason, scores, source = judgement.verdict, judgement.reason, judgement.scores, judgement.source
@@ -219,7 +224,10 @@ async def reflect_node(state: StepState) -> dict[str, Any]:
     task_cap = int(get_settings().MAX_TOTAL_REFLECTIONS)
 
     with usage_scope(node="reflect", step_id=step.step_id) as calls:
-        if reflections > MAX_STEP_REFLECTIONS or state.get("reflections_used_by_task", 0) >= task_cap:
+        if not get_settings().ENABLE_REFLECTION:
+            decision = {"action": "SKIP_STEP", "reasoning": "Reflection disabled.", "partial_result": "",
+                        "sub_steps": [], "modified_step": ""}
+        elif reflections > MAX_STEP_REFLECTIONS or state.get("reflections_used_by_task", 0) >= task_cap:
             decision = {"action": "SKIP_STEP", "reasoning": "Reflection limit reached for this step or task.",
                         "partial_result": "", "sub_steps": [], "modified_step": ""}
         else:
@@ -272,13 +280,14 @@ async def _run_sub_steps(state: StepState, step: StepDefinition, sub_steps: list
         result = await run_worker(agent, sub_step, state["original_input"], sub["description"],
                                   context + ("\n" + "\n".join(outputs) if outputs else ""), [],
                                   task_id=state["task_id"])
-        judgement = await judge_output(sub_step.name, sub["description"], result.output) if result.ok else None
+        usable = result.ok and not result.truncated
+        judgement = await judge_output(sub_step.name, sub["description"], result.output) if usable else None
         delta.setdefault("validation_log", []).append({
             "timestamp": _now(), "step_id": step.step_id, "sub_step": index,
             "validator_verdict": judgement.verdict if judgement else "retry",
             "reason": judgement.reason if judgement else (result.error or "no output"),
             "scores": judgement.scores if judgement else {}, "source": judgement.source if judgement else "deterministic"})
-        if result.ok and result.output:
+        if usable and judgement and judgement.verdict == "pass":
             outputs.append(f"[{sub.get('name') or f'part {index}'}]\n{result.output}")
     ok = len(outputs) == len(sub_steps)
     return StepResult(

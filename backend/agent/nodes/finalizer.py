@@ -6,9 +6,9 @@ from datetime import datetime, timezone
 import logging
 
 from agent.state import AgentState
-from config import get_settings
 from models import TraceEntry
-from services.llm_service import LLMError, call_llm
+from agent.reliability.fallback import complete
+from services.llm_service import LLMError
 from services.metrics_service import get_metrics_service
 
 logger = logging.getLogger(__name__)
@@ -196,16 +196,10 @@ async def finalizer_node(state: AgentState) -> AgentState:
 async def _synthesize_final_output(state: AgentState) -> tuple[str, str, int]:
     """Generate final synthesized report text with LLM, falling back to concatenation."""
     synthesis_prompt = _build_synthesis_prompt(state)
-    settings = get_settings()
-    model_name = settings.primary_model
-    provider = _infer_provider(model_name)
-
     try:
-        response = await call_llm(
+        response = await complete(
             prompt=synthesis_prompt,
             system_prompt="You are a report synthesizer.",
-            model=model_name,
-            provider=provider,
             temperature=0.2,
             max_tokens=4096,
             json_mode=False,
@@ -323,14 +317,6 @@ def _compute_total_duration_ms(started_at: str, completed_at: datetime) -> int:
     return max(0, int(duration.total_seconds() * 1000))
 
 
-def _infer_provider(model_name: str) -> str:
-    """Infer provider from model naming convention."""
-    normalized = model_name.strip().lower()
-    if normalized.startswith("claude"):
-        return "anthropic"
-    if normalized.startswith("gpt"):
-        return "openai"
-    return "open_source"
 
 
 def _record_task_metrics_snapshot(state: AgentState) -> None:

@@ -8,9 +8,9 @@ import logging
 import re
 from typing import Any
 
-from config import get_settings
 from models import StepDefinition
-from services.llm_service import LLMError, call_llm
+from agent.reliability.fallback import complete
+from services.llm_service import LLMError
 
 logger = logging.getLogger(__name__)
 
@@ -80,16 +80,10 @@ async def decide_recovery(
 
 async def _get_reflection_decision(prompt: str) -> tuple[dict[str, Any], str, int]:
     """Call LLM for reflection and return parsed decision + model metadata."""
-    settings = get_settings()
-    model_name = settings.primary_model
-    provider = _infer_provider(model_name)
-
     try:
-        response = await call_llm(
+        response = await complete(
             prompt=prompt,
             system_prompt=REFLECTOR_SYSTEM_PROMPT,
-            model=model_name,
-            provider=provider,
             temperature=0.2,
             max_tokens=1200,
             json_mode=True,
@@ -224,10 +218,3 @@ def _normalize_tool_needed(value: Any) -> str:
         return "llm_only"
     return "llm_only"
 
-
-def _infer_provider(model_name: str) -> str:
-    """Infer provider name from model naming convention."""
-    normalized = model_name.strip().lower()
-    if normalized.startswith("claude"):
-        return "anthropic"
-    return "openai"

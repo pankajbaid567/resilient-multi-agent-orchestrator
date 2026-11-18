@@ -54,9 +54,18 @@ class Settings(BaseSettings):
     SUPERVISOR_MODE: str = "llm"
     MAX_AGENT_TOOL_CALLS: int = 3
     MAX_TOTAL_REFLECTIONS: int = 5
+    # Ablation switch: when false a step that exhausts its retries is skipped without reflection.
+    ENABLE_REFLECTION: bool = True
+    # Ablation switch: when false, open circuits never skip a model.
+    ENABLE_CIRCUIT_BREAKER: bool = True
     # Checkpointer for LangGraph state: "memory" (default), "sqlite:///path.db" or a
     # postgresql:// URL (for example a free Neon database) for resume across restarts.
     CHECKPOINT_URL: str = "memory"
+    # Observability (see agent/telemetry.py). MODEL_PRICES is JSON:
+    # {"model-name": [usd_per_1M_input, usd_per_1M_output]}; unpriced models report no cost.
+    OTEL_SERVICE_NAME: str = "reliable-agent"
+    OTEL_CONSOLE_EXPORT: bool = False
+    MODEL_PRICES: str = ""
     ENABLE_CODE_EXEC: bool = False
     ENABLE_API_CALL: bool = False
     ADMIN_API_KEY: str | None = None

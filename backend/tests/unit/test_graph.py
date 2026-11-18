@@ -209,3 +209,21 @@ async def test_unexpected_error_fails_only_that_step(fake_llm, monkeypatch):
     assert {r.step_id: r.status for r in final["step_results"]} == {"step_1": "failed", "step_2": "failed"}
     assert final["status"] in {"completed", "failed"} and final["final_output"] is not None
     assert any(e["error_type"] == "STEP_CRASH" for e in final["error_log"])
+
+
+async def test_cut_off_answer_is_retried_without_calling_the_judge(fake_llm, monkeypatch):
+    original = fake_llm.call_openai
+    state = {"cut": True}
+
+    async def cut_first_worker_reply(**kwargs):
+        response = await original(**kwargs)
+        if fake_llm.calls[-1]["role"] == "executor" and state["cut"]:
+            state["cut"] = False
+            response.choices[0].finish_reason = "length"
+        return response
+
+    monkeypatch.setattr("services.llm_service._call_openai", cut_first_worker_reply)
+    final = await run_agent("task-cut", "Summarise solar panel efficiency")
+    first = [v for v in final["validation_log"] if v["step_id"] == "step_1"][0]
+    assert first["validator_verdict"] == "retry" and "cut off" in first["reason"] and first["source"] == "deterministic"
+    assert final["retry_counts"]["step_1"] == 1

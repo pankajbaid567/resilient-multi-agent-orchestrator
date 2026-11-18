@@ -15,6 +15,7 @@ from time import perf_counter
 
 from agent.reliability.circuit_breaker import get_circuit_breaker_manager
 from agent.reliability.fallback import call_with_fallback, default_chain
+from agent.telemetry import tracer
 from agent.tools.registry import AgentTool, tools_for
 from config import get_settings
 from models import StepDefinition
@@ -62,6 +63,7 @@ class WorkerResult:
     iterations: int
     tool_calls: list[ToolCall] = field(default_factory=list)
     error: str | None = None
+    truncated: bool = False
 
 
 def build_system_prompt(agent: SpecializedAgent, tools: list[AgentTool], max_calls: int) -> str:
@@ -98,7 +100,17 @@ def parse_reply(text: str) -> tuple[str, str | None, str | None]:
     return "plain", reply, None
 
 
-async def run_worker(
+async def run_worker(*args, **kwargs) -> WorkerResult:
+    """Run the agent's ReAct loop for one step inside an ``agent <role>`` span."""
+    agent: SpecializedAgent = kwargs.get("agent") or args[0]
+    with tracer().start_as_current_span(f"agent {agent.role}", attributes={"agent.role": agent.role}) as span:
+        result = await _run_worker(*args, **kwargs)
+        span.set_attributes({"agent.iterations": result.iterations, "agent.tool_calls": len(result.tool_calls),
+                             "agent.ok": result.ok})
+        return result
+
+
+async def _run_worker(
     agent: SpecializedAgent,
     step: StepDefinition,
     original_input: str,
@@ -152,7 +164,9 @@ async def run_worker(
                     observation_text = f"Unknown tool '{first}'. Available tools: {', '.join(tool_by_name) or 'none'}."
                     ok, error = False, "unknown tool"
                 else:
-                    observation = await tool.run(second or "")
+                    with tracer().start_as_current_span(f"tool {tool.name}", attributes={"tool.name": tool.name}) as span:
+                        observation = await tool.run(second or "")
+                        span.set_attribute("tool.ok", observation.ok)
                     observation_text, ok, error = observation.text, observation.ok, observation.error
                 tool_calls.append(ToolCall(first or "", (second or "")[:300], ok, error,
                                            int((perf_counter() - call_started) * 1000)))
@@ -172,7 +186,8 @@ async def run_worker(
             if not answer:
                 return WorkerResult(False, "", model_used, _elapsed(started), iterations, tool_calls,
                                     "empty final answer")
-            return WorkerResult(True, answer, model_used, _elapsed(started), iterations, tool_calls)
+            return WorkerResult(True, answer, model_used, _elapsed(started), iterations, tool_calls,
+                                truncated=response.truncated)
     except Exception as exc:
         logger.warning("worker_failed agent=%s step_id=%s error=%s", agent.role, step.step_id, exc)
         return WorkerResult(False, "", model_used, _elapsed(started), iterations, tool_calls, str(exc))
