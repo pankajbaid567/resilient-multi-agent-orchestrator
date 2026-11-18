@@ -81,3 +81,15 @@ def test_fence_cannot_be_closed_early():
 async def test_llm_only_step_runs_no_tool():
     outcome = await run_step_tool(_step("llm_only"))
     assert outcome.tool is None and outcome.ok and outcome.prompt_block == ""
+
+
+async def test_tool_failure_is_recorded_without_breaking_the_step(fake_llm, settings):
+    """A failed web search must be logged and traced, and the step must still run on the LLM."""
+    from agent.graph import run_agent
+
+    fake_llm.plan = [{"step_id": "step_1", "name": "Search", "description": "Search solar panel efficiency facts",
+                      "tool_needed": "web_search", "dependencies": [], "estimated_complexity": "low"}]
+    final = await run_agent("tool-fail", "Summarise solar panel efficiency")
+    assert final["step_results"][-1].status == "success"
+    assert any(entry.get("error_type") == "TOOL_FAILURE" for entry in final["error_log"])
+    assert any(event["event_type"] == "tool_failed" for event in final["execution_trace"])

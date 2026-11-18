@@ -183,6 +183,12 @@ class TraceEntry(BaseModel):
         "checkpoint_saved",
         "task_completed",
         "task_failed",
+        "tool_failed",
+        "budget_exceeded",
+        "plan_ready",
+        "supervisor_decision",
+        "agent_message",
+        "llm_call",
     ] = Field(..., description="Canonical trace event type.")
     step_id: Optional[str] = Field(default=None, description="Associated step ID, if event is step-scoped.")
     step_name: Optional[str] = Field(default=None, description="Associated step name, if known.")
