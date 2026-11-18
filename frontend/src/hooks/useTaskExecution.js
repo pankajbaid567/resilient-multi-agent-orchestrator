@@ -196,6 +196,9 @@ export default function useTaskExecution() {
 
     const response = await updateRuntimeConfig(patch);
     if (!response.success) {
+      // Roll back: the server did not apply the change (read-only deployment or error).
+      setRuntimeConfig(runtimeConfig);
+      persistRuntimeConfig(runtimeConfig);
       setError(response.error || "Failed to update runtime settings");
       return response;
     }

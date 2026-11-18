@@ -46,3 +46,6 @@ frontend/coverage/
 # Test and tooling caches
 .cache/
 coverage/
+# Eval smoke output from CI/local checks
+backend/eval/results/ci-smoke.*
+backend/checkpoints.db

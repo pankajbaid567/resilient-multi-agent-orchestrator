@@ -54,17 +54,19 @@ async def get_aggregate_metrics() -> AggregateMetrics:
 
 @router.get("/{task_id}", response_model=TaskMetrics)
 async def get_task_metrics(task_id: str) -> TaskMetrics:
-    """Return task metrics, computing and caching them from checkpoint state when needed."""
-    service = get_metrics_service()
-    metrics = service.get_task_metrics(task_id)
-    if metrics is not None:
-        return metrics
+    """Return task metrics computed from the saved run state (the source of truth).
 
+    The cached snapshot is used only when no saved state exists (for example after the
+    in-memory checkpointer was reset); it is taken inside the finalizer and misses the
+    finalizer's own model call.
+    """
+    service = get_metrics_service()
     state = await get_task_state(task_id)
     if state is None:
+        cached = service.get_task_metrics(task_id)
+        if cached is not None:
+            return cached
         raise HTTPException(status_code=404, detail=f"Task not found: {task_id}")
-    if not isinstance(state, dict):
-        raise HTTPException(status_code=500, detail=f"Invalid checkpoint format for task: {task_id}")
 
     typed_state: AgentState = state  # type: ignore[assignment]
     service.record_task_metrics(task_id, typed_state)

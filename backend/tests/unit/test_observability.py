@@ -84,3 +84,21 @@ async def test_spans_cover_task_steps_agents_and_model_calls(fake_llm, spans):
     step_span = by_id[agent_span.parent.span_id]
     assert step_span.name.startswith("step ")
     assert by_id[step_span.parent.span_id].name == "task.execute"
+
+
+async def test_task_metrics_endpoint_uses_recorded_calls(fake_llm):
+    from fastapi.testclient import TestClient
+
+    import main
+    from agent.graph import run_agent
+
+    final = await run_agent("metrics-1", "Summarise solar panel efficiency")
+    client = TestClient(main.app)
+    metrics = client.get("/metrics/metrics-1").json()
+    assert metrics["tokens_input"] + metrics["tokens_output"] == final["llm_tokens_used"]
+    assert metrics["llm_usage"]["calls"] == len(final["llm_calls"])
+    assert metrics["estimated_cost_usd"] == 0.0  # no prices configured -> no guessed cost
+    providers = client.get("/metrics/providers")
+    assert providers.status_code == 200
+    trace_summary = client.get("/traces/metrics-1/summary")
+    assert trace_summary.status_code == 200 and trace_summary.json()["total_events"] > 0

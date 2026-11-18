@@ -72,7 +72,23 @@ function normalizeError(err) {
     success: false,
     data: null,
     error: String(message),
+    status: err?.response?.status ?? null,
   };
+}
+
+function isAccessDenied(response) {
+  return response?.status === 401 || response?.status === 403;
+}
+
+// Runtime settings are admin-only on the server (X-Admin-Key). An operator can store the key in
+// this browser with: localStorage.setItem("agent_admin_key", "<key>")
+function adminHeaders() {
+  try {
+    const key = window.localStorage.getItem("agent_admin_key");
+    return key ? { headers: { "X-Admin-Key": key } } : {};
+  } catch {
+    return {};
+  }
 }
 
 async function safeRequest(requestFn) {
@@ -240,8 +256,10 @@ export async function getChaosMode() {
 }
 
 export async function setChaosMode(enabled) {
-  const primary = await safeRequest(() => apiClient.post("/config/chaos", { enabled: Boolean(enabled) }));
-  if (primary.success) {
+  const primary = await safeRequest(() =>
+    apiClient.post("/config/chaos", { enabled: Boolean(enabled) }, adminHeaders()),
+  );
+  if (primary.success || isAccessDenied(primary)) {
     return primary;
   }
   return safeRequest(() => apiClient.post("/config/chaos-mode", { enabled: Boolean(enabled) }));
@@ -279,8 +297,8 @@ export async function updateRuntimeConfig(partialConfig) {
     };
   }
 
-  const configResponse = await safeRequest(() => apiClient.post("/config", partialConfig));
-  if (configResponse.success) {
+  const configResponse = await safeRequest(() => apiClient.post("/config", partialConfig, adminHeaders()));
+  if (configResponse.success || isAccessDenied(configResponse)) {
     return configResponse;
   }
 

@@ -107,7 +107,9 @@ async def call_with_fallback(
                 await _log_fallback_transition(chain=chain, index=index, reason=reason)
                 continue
 
-        async def _attempt(provider: str = provider, model: str = model) -> LLMResponse:
+        async def _attempt(
+            provider: str = provider, model: str = model, chaos_mode_enabled: bool = chaos_mode_enabled
+        ) -> LLMResponse:
             # Chaos is injected inside the retried call, so the retry layer sees an injected
             # failure exactly as it would see a real one.
             injection = None

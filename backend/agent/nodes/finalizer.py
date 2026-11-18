@@ -13,12 +13,6 @@ from services.metrics_service import get_metrics_service
 
 logger = logging.getLogger(__name__)
 
-MODEL_COST_RATES = {
-    "gpt-4o": {"input_per_million": 2.50, "output_per_million": 10.00},
-    "gpt-4o-mini": {"input_per_million": 0.15, "output_per_million": 0.60},
-    "claude-3-5-sonnet": {"input_per_million": 3.00, "output_per_million": 15.00},
-}
-
 
 def final_result_per_step(state: AgentState) -> list:
     """Return the last recorded result for each step.
@@ -89,7 +83,7 @@ async def finalizer_node(state: AgentState) -> AgentState:
         total_reflections = sum(state["reflection_counts"].values())
 
         models_used = _collect_models_used(state)
-        estimated_cost_usd = _estimate_cost_usd(state)
+        estimated_cost_usd = None  # filled from recorded calls and MODEL_PRICES by the graph
         total_duration_ms = _compute_total_duration_ms(state["started_at"], now)
 
         summary_dict = {
@@ -160,7 +154,7 @@ async def finalizer_node(state: AgentState) -> AgentState:
                 "total_retries": sum(state["retry_counts"].values()),
                 "total_reflections": sum(state["reflection_counts"].values()),
                 "total_tokens": state["llm_tokens_used"],
-                "estimated_cost_usd": _estimate_cost_usd(state),
+                "estimated_cost_usd": None,
                 "total_duration_ms": _compute_total_duration_ms(state["started_at"], now),
                 "models_used": _collect_models_used(state),
                 "confidence": compute_confidence(state),
@@ -264,36 +258,6 @@ def _fallback_concatenated_output(state: AgentState) -> str:
         parts.append("\nNo step outputs were available to aggregate.")
 
     return "\n".join(parts)
-
-
-def _estimate_cost_usd(state: AgentState) -> float:
-    """Estimate USD cost from step token usage and model-specific rates."""
-    total_cost = 0.0
-    for result in state["step_results"]:
-        model_key = _normalize_model_key(result.model_used)
-        rates = MODEL_COST_RATES.get(model_key)
-        if rates is None or result.tokens_used <= 0:
-            continue
-
-        # StepResult tracks total tokens only; estimate input/output split evenly.
-        input_tokens = result.tokens_used // 2
-        output_tokens = result.tokens_used - input_tokens
-        total_cost += (input_tokens / 1_000_000) * rates["input_per_million"]
-        total_cost += (output_tokens / 1_000_000) * rates["output_per_million"]
-
-    return round(total_cost, 8)
-
-
-def _normalize_model_key(model_name: str) -> str:
-    """Normalize model names to known pricing keys."""
-    normalized = (model_name or "").strip().lower()
-    if normalized.startswith("gpt-4o-mini"):
-        return "gpt-4o-mini"
-    if normalized.startswith("gpt-4o"):
-        return "gpt-4o"
-    if "claude" in normalized and "sonnet" in normalized:
-        return "claude-3-5-sonnet"
-    return ""
 
 
 def _collect_models_used(state: AgentState) -> list[str]:

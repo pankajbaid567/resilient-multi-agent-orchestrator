@@ -114,6 +114,6 @@ def is_chaos_mode_enabled() -> bool:
 
 def _tag_chaos_exception(error: Exception, injection_type: str) -> Exception:
     """Attach chaos metadata on exceptions for downstream trace tagging."""
-    setattr(error, "chaos_injected", True)
-    setattr(error, "injection_type", injection_type)
+    error.chaos_injected = True
+    error.injection_type = injection_type
     return error

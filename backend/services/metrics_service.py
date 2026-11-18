@@ -2,19 +2,13 @@
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from agent.state import AgentState
 from models import AggregateMetrics, TaskMetrics, TraceSummary
 from services.llm_metrics import summarize_llm_calls
-
-MODEL_COST_RATES_USD_PER_MILLION = {
-    "gpt-4o": {"input": 2.50, "output": 10.00},
-    "gpt-4o-mini": {"input": 0.15, "output": 0.60},
-    "claude-3.5": {"input": 3.00, "output": 15.00},
-}
 
 
 class MetricsService:
@@ -92,14 +86,8 @@ class MetricsService:
         failure_types = self._collect_failure_types(error_log=error_log, step_results=step_results)
         reflection_strategies = self._collect_reflection_strategies(trace=trace)
 
-        if llm_usage is not None:
-            estimated_cost_usd = float(llm_usage["cost_usd"] or 0.0)
-        else:
-            estimated_cost_usd = self._estimate_cost_usd(
-                step_results=step_results,
-                trace=trace,
-                fallback_total_tokens=total_tokens,
-            )
+        # Cost only from recorded calls and configured prices; never a guess.
+        estimated_cost_usd = float((llm_usage or {}).get("cost_usd") or 0.0)
 
         time_saved_parallel_ms = self._estimate_parallel_time_saved(
             state_data=state_data,
@@ -295,63 +283,6 @@ class MetricsService:
         estimated_input = total_tokens // 2
         estimated_output = total_tokens - estimated_input
         return estimated_input, estimated_output
-
-    def _estimate_cost_usd(
-        self,
-        step_results: list[Any],
-        trace: list[dict[str, Any]],
-        fallback_total_tokens: int,
-    ) -> float:
-        """Estimate total model spend using model-specific input/output rates."""
-        tokens_by_model: dict[str, dict[str, int]] = defaultdict(lambda: {"input": 0, "output": 0})
-
-        for event in trace:
-            details = dict(event.get("details") or {})
-            model_name = self._normalize_optional_string(
-                event.get("model_used") or details.get("model_used")
-            )
-            if not model_name:
-                continue
-
-            tokens_in = max(0, self._to_int(event.get("tokens_in", details.get("tokens_in"))))
-            tokens_out = max(0, self._to_int(event.get("tokens_out", details.get("tokens_out"))))
-
-            if tokens_in == 0 and tokens_out == 0:
-                total_tokens = max(0, self._to_int(event.get("tokens_used", details.get("tokens_used"))))
-                tokens_in = total_tokens // 2
-                tokens_out = total_tokens - tokens_in
-
-            tokens_by_model[model_name]["input"] += tokens_in
-            tokens_by_model[model_name]["output"] += tokens_out
-
-        if not tokens_by_model:
-            for result in step_results:
-                model_name = self._normalize_optional_string(self._get_field(result, "model_used"))
-                if not model_name:
-                    continue
-
-                total_tokens = max(0, self._to_int(self._get_field(result, "tokens_used")))
-                tokens_in = total_tokens // 2
-                tokens_out = total_tokens - tokens_in
-                tokens_by_model[model_name]["input"] += tokens_in
-                tokens_by_model[model_name]["output"] += tokens_out
-
-        if not tokens_by_model and fallback_total_tokens > 0:
-            # Last-resort estimate when model metadata is absent.
-            tokens_by_model["gpt-4o"]["input"] += fallback_total_tokens // 2
-            tokens_by_model["gpt-4o"]["output"] += fallback_total_tokens - (fallback_total_tokens // 2)
-
-        total_cost = 0.0
-        for model_name, token_split in tokens_by_model.items():
-            price_key = self._model_pricing_key(model_name)
-            rates = MODEL_COST_RATES_USD_PER_MILLION.get(price_key)
-            if rates is None:
-                continue
-
-            total_cost += (token_split["input"] / 1_000_000) * rates["input"]
-            total_cost += (token_split["output"] / 1_000_000) * rates["output"]
-
-        return round(total_cost, 8)
 
     def _collect_models_used(self, step_results: list[Any], trace: list[dict[str, Any]]) -> Dict[str, int]:
         """Count model call frequency from step results, then trace as fallback."""
@@ -729,18 +660,6 @@ class MetricsService:
             completed = datetime.now(timezone.utc)
 
         return max(0, int((completed - started).total_seconds() * 1000))
-
-    @staticmethod
-    def _model_pricing_key(model_name: str) -> str:
-        """Normalize model names to pricing-table keys."""
-        normalized = (model_name or "").strip().lower()
-        if normalized.startswith("gpt-4o-mini"):
-            return "gpt-4o-mini"
-        if normalized.startswith("gpt-4o"):
-            return "gpt-4o"
-        if "claude" in normalized and ("3.5" in normalized or "3-5" in normalized or "sonnet" in normalized):
-            return "claude-3.5"
-        return ""
 
     @staticmethod
     def _infer_provider_from_model(model_name: Optional[str]) -> Optional[str]:
