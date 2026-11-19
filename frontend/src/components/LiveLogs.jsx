@@ -78,6 +78,9 @@ export default function LiveLogs({ events = [] }) {
 
       <div
         ref={containerRef}
+        tabIndex={0}
+        role="region"
+        aria-label="Live event log"
         className="max-h-72 overflow-y-auto rounded-xl border border-white/10 bg-[#060b17] p-3 font-mono text-[12px] leading-relaxed text-[#d8e6ff]"
       >
         {lines.length === 0 ? (

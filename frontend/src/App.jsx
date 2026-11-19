@@ -1,25 +1,32 @@
 import { AnimatePresence, motion } from "framer-motion";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import AboutDialog from "./components/AboutDialog";
+import ConfigView from "./components/ConfigView";
 import ExecutionFlowGraph from "./components/ExecutionFlowGraph";
 import LiveLogs from "./components/LiveLogs";
-import MetricsDashboard from "./components/MetricsDashboard";
+import PlanReview from "./components/PlanReview";
+import ResultCard from "./components/ResultCard";
 import StepCard from "./components/StepCard";
-import StepDetailModal from "./components/StepDetailModal";
 import TaskInput from "./components/TaskInput";
 import ToastStack from "./components/ToastStack";
-import TraceTimeline from "./components/TraceTimeline";
-import TraceWaterfall from "./components/TraceWaterfall";
 import useTaskExecution from "./hooks/useTaskExecution";
 
+// Charts (recharts) only load when the Metrics or Trace tab is opened.
+const RunMetrics = lazy(() => import("./components/RunMetrics"));
+const TraceTimeline = lazy(() => import("./components/TraceTimeline"));
+const TraceWaterfall = lazy(() => import("./components/TraceWaterfall"));
+const StepDetailModal = lazy(() => import("./components/StepDetailModal"));
+
 const NAV_ITEMS = [
-  { id: "execute", label: "▶️ Execute" },
-  { id: "trace", label: "📊 Trace" },
-  { id: "metrics", label: "📈 Metrics" },
-  { id: "settings", label: "⚙️ Settings" },
+  { id: "execute", label: "Run" },
+  { id: "trace", label: "Trace" },
+  { id: "metrics", label: "Metrics" },
+  { id: "settings", label: "Configuration" },
 ];
+
+// Internal events that add noise to logs and timelines without telling the user anything.
+const HIDDEN_EVENT_TYPES = new Set(["step_status", "ping", "checkpoint_saved"]);
 
 const STATUS_META = {
   Idle: {
@@ -37,6 +44,16 @@ const STATUS_META = {
     badgeClass: "border-sky-400/45 bg-sky-500/20 text-sky-100",
     pulse: true,
   },
+  "Plan ready": {
+    dotClass: "bg-sky-300",
+    badgeClass: "border-sky-400/45 bg-sky-500/15 text-sky-100",
+    pulse: false,
+  },
+  Failed: {
+    dotClass: "bg-red-300",
+    badgeClass: "border-red-400/45 bg-red-500/15 text-red-100",
+    pulse: false,
+  },
   Complete: {
     dotClass: "bg-[var(--accent-success)]",
     badgeClass: "border-emerald-400/45 bg-emerald-500/20 text-emerald-100",
@@ -50,11 +67,7 @@ const SETTINGS_DEFAULT = {
   multi_agent_mode: true,
   max_retries: 3,
   step_timeout: 60,
-  providers: [
-    { provider: "open_source", model: "meta-llama/Llama-3.1-8B-Instruct", label: "Primary (Llama 3.1)" },
-    { provider: "open_source", model: "Qwen/Qwen2.5-7B-Instruct", label: "Fallback (Qwen 2.5)" },
-    { provider: "open_source", model: "mistralai/Mistral-7B-Instruct-v0.3", label: "Fallback (Mistral 7B)" },
-  ],
+  providers: [],
 };
 
 export default function App() {
@@ -74,7 +87,8 @@ export default function App() {
     agentContributions,
     metrics,
     submitTask,
-    updateRuntimeSettings,
+    runPlannedTask,
+    resetTask,
     clearError,
     isLoading,
     isConnected,
@@ -88,8 +102,7 @@ export default function App() {
   const [selectedStepErrors, setSelectedStepErrors] = useState([]);
   const [isStepModalOpen, setIsStepModalOpen] = useState(false);
   const [toasts, setToasts] = useState([]);
-  const [isSettingsSaving, setIsSettingsSaving] = useState(false);
-  const [providerDraft, setProviderDraft] = useState(SETTINGS_DEFAULT.providers);
+  const [isAboutOpen, setIsAboutOpen] = useState(false);
 
   const processedToastKeysRef = useRef(new Set());
   const toastTimersRef = useRef(new Map());
@@ -103,10 +116,6 @@ export default function App() {
     }),
     [runtimeConfig],
   );
-
-  useEffect(() => {
-    setProviderDraft(Array.isArray(settings.providers) ? settings.providers : SETTINGS_DEFAULT.providers);
-  }, [settings.providers]);
 
   useEffect(() => {
     return () => {
@@ -236,55 +245,21 @@ export default function App() {
   const confidence = String(task?.confidence_score || task?.final_output?.summary?.confidence || "Unknown");
   const hasFinalResult = Boolean(task?.final_output?.result);
 
-  const metricsSummary = useMemo(() => {
-    return [
-      { label: "Tokens", value: Number(metrics?.totalTokens || 0).toLocaleString() },
-      { label: "Est. Cost", value: `$${Number(metrics?.estimatedCost || 0).toFixed(4)}` },
-      { label: "Retries", value: Number(metrics?.retryCount || 0) },
-      { label: "Fallbacks", value: Number(metrics?.fallbackCount || 0) },
-      { label: "Reflections", value: Number(metrics?.reflectionCount || 0) },
-      { label: "Agents", value: Number(metrics?.agentCount || 0) },
-      { label: "Parallel Levels", value: Number(metrics?.activeParallelLevelCount || 0) },
-      { label: "Confidence", value: confidence },
-    ];
-  }, [confidence, metrics]);
-
-  const dashboardMetrics = useMemo(() => {
-    const aggregate = aggregateMetrics && typeof aggregateMetrics === "object" ? aggregateMetrics : {};
-    const taskSpecific = taskMetrics && typeof taskMetrics === "object" ? taskMetrics : {};
-
-    return {
-      ...aggregate,
-      ...taskSpecific,
-      retry_count: Number(taskSpecific.retry_count || metrics?.retryCount || 0),
-      reflection_count: Number(taskSpecific.reflection_count || metrics?.reflectionCount || 0),
-      total_tokens_consumed: Number(
-        taskSpecific.total_tokens_consumed ||
-          taskSpecific.total_tokens ||
-          metrics?.totalTokens ||
-          0,
-      ),
-      total_cost_usd: Number(taskSpecific.total_cost_usd || metrics?.estimatedCost || 0),
-      agent_contributions:
-        Object.keys(agentContributions || {}).length > 0
-          ? agentContributions
-          : aggregate.agent_contributions,
-    };
-  }, [agentContributions, aggregateMetrics, metrics, taskMetrics]);
-
-  const applyRuntimePatch = useCallback(async (patch) => {
-    setIsSettingsSaving(true);
-    const response = await updateRuntimeSettings(patch);
-    setIsSettingsSaving(false);
-
-    if (!response.success) {
-      pushToast(response.error || "Failed to update settings", "error", 4200);
-      return response;
-    }
-
-    pushToast("Runtime settings updated", "success", 1800);
-    return response;
-  }, [pushToast, updateRuntimeSettings]);
+  const visibleTrace = useMemo(() => {
+    let completionSeen = false;
+    return (Array.isArray(trace) ? trace : []).filter((event) => {
+      const type = String(event?.event_type || "").toLowerCase();
+      if (HIDDEN_EVENT_TYPES.has(type) || type.startsWith("ws_")) {
+        return false;
+      }
+      if (type === "task_completed") {
+        // The finalizer's trace entry and the live completion event describe the same moment.
+        if (completionSeen) return false;
+        completionSeen = true;
+      }
+      return true;
+    });
+  }, [trace]);
 
   const openStepModalFromAny = useCallback((payload) => {
     const identity = extractStepIdentity(payload);
@@ -341,18 +316,27 @@ export default function App() {
     setIsStepModalOpen(true);
   }, [resultByStepId, steps, task?.error_log, task?.validation_log, trace]);
 
-  const handleTaskSubmit = useCallback(async (input) => {
+  const handleTaskSubmit = useCallback(async (input, options = {}) => {
     setActiveView("execute");
-    const response = await submitTask(input);
+    const response = await submitTask(input, options);
 
     if (!response?.success) {
       pushToast(response?.error || "Failed to submit task", "error", 4200);
       return response;
     }
 
-    pushToast("Task submitted and execution started", "success", 2200);
+    if (!response.planned) {
+      pushToast("Run started", "success", 2200);
+    }
     return response;
   }, [pushToast, submitTask]);
+
+  const handleRunPlan = useCallback(async () => {
+    const response = await runPlannedTask();
+    if (!response?.success) {
+      pushToast(response?.error || "Could not start the run", "error", 4200);
+    }
+  }, [pushToast, runPlannedTask]);
 
   const handleTraceEventClick = useCallback((event) => {
     const payload = {
@@ -364,6 +348,8 @@ export default function App() {
     openStepModalFromAny(payload);
   }, [openStepModalFromAny]);
 
+  const isPlanned = String(task?.status || "") === "planned" && results.length === 0;
+
   const renderActiveView = () => {
     if (activeView === "execute") {
       return (
@@ -371,13 +357,15 @@ export default function App() {
           task={task}
           steps={steps}
           results={results}
-          trace={trace}
-          metricsSummary={metricsSummary}
+          trace={visibleTrace}
           currentStepIndex={currentStepIndex}
           isLoading={isLoading}
+          isPlanned={isPlanned}
           isStepSheetOpen={isStepSheetOpen}
           onToggleStepSheet={() => setIsStepSheetOpen((previous) => !previous)}
           onTaskSubmit={handleTaskSubmit}
+          onRunPlan={handleRunPlan}
+          onReset={resetTask}
           onStepClick={openStepModalFromAny}
           resultByStepId={resultByStepId}
         />
@@ -387,8 +375,7 @@ export default function App() {
     if (activeView === "trace") {
       return (
         <TraceView
-          trace={trace}
-          traceSummary={traceSummary}
+          trace={visibleTrace}
           steps={steps}
           results={results}
           onTraceEventClick={handleTraceEventClick}
@@ -398,25 +385,10 @@ export default function App() {
     }
 
     if (activeView === "metrics") {
-      return (
-        <MetricsView
-          dashboardMetrics={dashboardMetrics}
-          providerMetrics={providerMetrics}
-          agentAssignments={agentAssignments}
-          parallelLevels={parallelLevels}
-        />
-      );
+      return <RunMetrics task={task} aggregateMetrics={aggregateMetrics} />;
     }
 
-    return (
-      <SettingsView
-        settings={settings}
-        providerDraft={providerDraft}
-        setProviderDraft={setProviderDraft}
-        isSaving={isSettingsSaving}
-        onPatch={applyRuntimePatch}
-      />
-    );
+    return <ConfigView config={settings} />;
   };
 
   return (
@@ -426,26 +398,28 @@ export default function App() {
       <div className="relative z-10 mx-auto w-full max-w-[1500px] px-4 py-4 sm:px-6 lg:px-8">
         <header className="glass rounded-2xl border border-white/15 p-4 sm:p-5">
           <div className="flex flex-wrap items-start justify-between gap-4">
-            <div>
+            <div className="min-w-0">
               <h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">
                 <span className="bg-gradient-to-r from-sky-300 via-cyan-200 to-emerald-200 bg-clip-text text-transparent">
-                  ⚡ Reliable AI Agent
+                  Reliable AI Agent
                 </span>
               </h1>
               <p className="mt-1 max-w-3xl text-sm text-[var(--text-secondary)]">
-                Mission control for execution trace, reliability observability, parallel DAG flow, and multi-agent operations.
+                Plans a task, runs specialist agents in parallel, checks every answer and recovers from model failures.
+                LangGraph on Amazon Bedrock.
               </p>
             </div>
 
             <div className="flex flex-wrap items-center gap-2">
               <StatusBadge status={executionStatusLabel} statusMeta={statusMeta} />
-              <ConnectionBadge isConnected={isConnected} />
-
-              {settings.parallel_mode ? (
-                <MetaBadge value={`${Number(metrics?.activeParallelLevelCount || 0)} parallel levels`} />
-              ) : null}
-
-              <MetaBadge value={`${Number(metrics?.agentCount || 0)} active agents`} />
+              {isConnected ? <LiveBadge /> : null}
+              <button
+                type="button"
+                onClick={() => setIsAboutOpen(true)}
+                className="rounded-full border border-white/15 bg-white/5 px-3 py-1 text-xs text-[var(--text-secondary)] transition hover:border-sky-400/40 hover:text-[var(--text-primary)]"
+              >
+                About this demo
+              </button>
             </div>
           </div>
 
@@ -456,6 +430,7 @@ export default function App() {
                 <button
                   key={item.id}
                   type="button"
+                  aria-current={isActive ? "page" : undefined}
                   onClick={() => setActiveView(item.id)}
                   className={`rounded-xl border px-3 py-2 text-sm font-medium transition ${isActive
                     ? "border-sky-400/55 bg-sky-500/20 text-sky-100"
@@ -492,44 +467,27 @@ export default function App() {
             exit={{ opacity: 0, y: -8 }}
             transition={{ duration: 0.22 }}
           >
-            {renderActiveView()}
+            <Suspense fallback={<div className="rounded-2xl border border-white/10 bg-[var(--bg-card)]/70 p-5 text-sm text-[var(--text-secondary)]">Loading…</div>}>
+              {renderActiveView()}
+            </Suspense>
           </motion.section>
         </AnimatePresence>
 
-        {hasFinalResult ? (
-          <motion.section
-            className="mt-5 rounded-2xl border border-emerald-400/35 bg-emerald-500/10 p-4 sm:p-5"
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.2 }}
-          >
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div>
-                <h3 className="text-base font-semibold text-emerald-100">Final Result Available</h3>
-                <p className="text-sm text-emerald-50/90">
-                  Confidence: {confidence}. Open any step card, graph node, or trace event for deep diagnostics.
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={() => setActiveView("trace")}
-                className="rounded-lg border border-emerald-300/45 bg-emerald-500/20 px-3 py-2 text-sm font-medium text-emerald-100 transition hover:bg-emerald-500/30"
-              >
-                Inspect Full Trace
-              </button>
-            </div>
-          </motion.section>
-        ) : null}
       </div>
 
-      <StepDetailModal
-        isOpen={isStepModalOpen}
-        step={selectedStep}
-        stepTrace={selectedStepTrace}
-        errors={selectedStepErrors}
-        onClose={() => setIsStepModalOpen(false)}
-      />
+      {isStepModalOpen ? (
+        <Suspense fallback={null}>
+          <StepDetailModal
+            isOpen={isStepModalOpen}
+            step={selectedStep}
+            stepTrace={selectedStepTrace}
+            errors={selectedStepErrors}
+            onClose={() => setIsStepModalOpen(false)}
+          />
+        </Suspense>
+      ) : null}
 
+      <AboutDialog open={isAboutOpen} onClose={() => setIsAboutOpen(false)} />
       <ToastStack toasts={toasts} onDismiss={dismissToast} />
     </main>
   );
@@ -540,122 +498,164 @@ function ExecuteView({
   steps,
   results,
   trace,
-  metricsSummary,
   currentStepIndex,
   isLoading,
+  isPlanned,
   isStepSheetOpen,
   onToggleStepSheet,
   onTaskSubmit,
+  onRunPlan,
+  onReset,
   onStepClick,
   resultByStepId,
 }) {
+  const status = String(task?.status || "");
+  const isRunning = ["executing", "running", "validating", "reflecting", "resumed"].includes(status);
+  const isDone = status === "completed" || status === "failed";
+  const doneCount = steps.filter((step) => resultByStepId.has(String(step?.step_id || ""))).length;
+
   return (
     <div className="space-y-5">
-      <div className="grid gap-5 xl:grid-cols-[360px_minmax(0,1fr)]">
+      <div className="grid gap-5 xl:grid-cols-[400px_minmax(0,1fr)]">
         <div className="space-y-5">
-          <section className="rounded-2xl border border-white/10 bg-[var(--bg-card)]/70 p-4 sm:p-5">
-            <h2 className="text-lg font-semibold text-[var(--text-primary)]">Launch Task</h2>
-            <p className="mb-3 text-xs text-[var(--text-secondary)]">
-              Submit a multi-step goal to trigger planner, executor, reliability loops, and finalizer.
-            </p>
-            <TaskInput onSubmit={onTaskSubmit} isLoading={isLoading} />
-          </section>
+          {isPlanned ? (
+            <PlanReview
+              steps={steps}
+              levels={task?.execution_levels || []}
+              isLoading={isLoading}
+              onRun={onRunPlan}
+              onReset={onReset}
+            />
+          ) : (
+            <section className="rounded-2xl border border-white/10 bg-[var(--bg-card)]/70 p-4 sm:p-5">
+              <div className="flex items-baseline justify-between gap-2">
+                <h2 className="text-lg font-semibold text-[var(--text-primary)]">{isDone ? "New task" : "Task"}</h2>
+                {isDone ? (
+                  <button type="button" onClick={onReset} className="text-xs text-sky-200 underline-offset-2 hover:underline">
+                    Clear current run
+                  </button>
+                ) : null}
+              </div>
+              {isRunning ? (
+                <div className="mt-3 rounded-xl border border-sky-400/25 bg-sky-500/10 p-3 text-sm text-sky-100" role="status" aria-live="polite">
+                  Running: {doneCount} of {steps.length} steps finished. Answers are reviewed as they arrive.
+                </div>
+              ) : (
+                <div className="mt-3">
+                  <TaskInput onSubmit={onTaskSubmit} isLoading={isLoading} />
+                </div>
+              )}
+            </section>
+          )}
 
-          <QuickMetricsPanel metricsSummary={metricsSummary} />
-
-          <LiveLogs events={trace} />
+          <details className="group rounded-2xl border border-white/10 bg-[var(--bg-card)]/70 p-4 sm:p-5" open={isRunning}>
+            <summary className="cursor-pointer list-none text-sm font-semibold text-[var(--text-primary)]">
+              Live log <span className="font-normal text-[var(--text-secondary)]">({trace.length} events)</span>
+            </summary>
+            <div className="mt-3">
+              <LiveLogs events={trace} />
+            </div>
+          </details>
         </div>
 
         <div className="space-y-5">
-          <ExecutionFlowGraph
-            steps={steps}
-            results={results}
-            trace={trace}
-            currentStepIndex={currentStepIndex}
-            onStepClick={(stepNode) => onStepClick(stepNode)}
-          />
+          <ResultCard task={task} />
 
-          {task?.final_output?.result ? (
-            <section className="rounded-2xl border border-white/10 bg-[var(--bg-card)]/70 p-4">
-              <p className="mb-2 text-xs uppercase tracking-wide text-[var(--text-secondary)]">Final Output Preview</p>
-              <div className="prose prose-sm prose-invert max-w-none max-h-96 overflow-y-auto leading-relaxed">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{cleanModelMarkdown(task.final_output.result)}</ReactMarkdown>
-              </div>
-            </section>
+          {steps.length > 0 && !isPlanned ? (
+            <ExecutionFlowGraph
+              steps={steps}
+              results={results}
+              trace={trace}
+              currentStepIndex={currentStepIndex}
+              onStepClick={(stepNode) => onStepClick(stepNode)}
+            />
+          ) : !isPlanned ? (
+            <EmptyRunState />
           ) : null}
         </div>
       </div>
 
-      <section className="rounded-2xl border border-white/10 bg-[var(--bg-card)]/70 p-3 sm:p-4">
-        <div className="mb-3 flex items-center justify-between gap-3">
-          <h3 className="text-sm font-semibold text-[var(--text-primary)]">Step Cards</h3>
-          <button
-            type="button"
-            onClick={onToggleStepSheet}
-            className="rounded-lg border border-white/15 bg-white/5 px-3 py-1.5 text-xs text-[var(--text-secondary)] transition hover:border-sky-400/40 hover:text-[var(--text-primary)]"
-          >
-            {isStepSheetOpen ? "Collapse" : "Expand"}
-          </button>
-        </div>
-
-        <AnimatePresence initial={false}>
-          {isStepSheetOpen ? (
-            <motion.div
-              initial={{ opacity: 0, height: 0 }}
-              animate={{ opacity: 1, height: "auto" }}
-              exit={{ opacity: 0, height: 0 }}
-              transition={{ duration: 0.2 }}
-              className="overflow-x-auto"
+      {steps.length > 0 && !isPlanned ? (
+        <section className="rounded-2xl border border-white/10 bg-[var(--bg-card)]/70 p-3 sm:p-4">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <h3 className="text-sm font-semibold text-[var(--text-primary)]">Steps</h3>
+            <button
+              type="button"
+              onClick={onToggleStepSheet}
+              aria-expanded={isStepSheetOpen}
+              className="rounded-lg border border-white/15 bg-white/5 px-3 py-1.5 text-xs text-[var(--text-secondary)] transition hover:border-sky-400/40 hover:text-[var(--text-primary)]"
             >
-              {steps.length === 0 ? (
-                <div className="rounded-xl border border-white/10 bg-[#0c142a]/80 p-4 text-sm text-[var(--text-secondary)]">
-                  Step cards will appear once planning completes.
-                </div>
-              ) : (
-                <div className="flex min-w-max gap-3 pb-1">
-                  {steps.map((step, index) => {
-                    const stepId = String(step?.step_id || `step_${index + 1}`);
-                    return (
-                      <div key={stepId} className="w-[320px] shrink-0">
-                        <StepCard
-                          step={step}
-                          result={resultByStepId.get(stepId) || null}
-                          index={index}
-                          isActive={index === currentStepIndex}
-                          onClick={(selected) => onStepClick(selected || step)}
-                        />
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </motion.div>
+              {isStepSheetOpen ? "Hide" : "Show"}
+            </button>
+          </div>
+          {isStepSheetOpen ? (
+            <div tabIndex={0} role="region" aria-label="Step cards" className="overflow-x-auto">
+              <div className="flex min-w-max gap-3 pb-1">
+                {steps.map((step, index) => {
+                  const stepId = String(step?.step_id || `step_${index + 1}`);
+                  return (
+                    <div key={stepId} className="w-[320px] shrink-0">
+                      <StepCard
+                        step={step}
+                        result={resultByStepId.get(stepId) || null}
+                        index={index}
+                        isActive={index === currentStepIndex}
+                        onClick={(selected) => onStepClick(selected || step)}
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
           ) : null}
-        </AnimatePresence>
-      </section>
+        </section>
+      ) : null}
     </div>
+  );
+}
+
+function EmptyRunState() {
+  const stages = [
+    ["Plan", "A planner splits your task into steps and finds which can run in parallel."],
+    ["Run", "A supervisor hands each step to a specialist agent; independent steps run together."],
+    ["Review", "A reviewer model checks every answer; weak ones are retried with its feedback or rewritten."],
+    ["Combine", "A finalizer writes one answer from the reviewed steps."],
+  ];
+  return (
+    <section className="rounded-2xl border border-white/10 bg-[var(--bg-card)]/70 p-4 sm:p-5">
+      <h2 className="text-base font-semibold text-[var(--text-primary)]">How a run works</h2>
+      <ol className="mt-3 grid gap-3 sm:grid-cols-2">
+        {stages.map(([title, text], index) => (
+          <li key={title} className="rounded-xl border border-white/10 bg-[#0c142a]/70 p-3">
+            <p className="text-sm font-medium text-[var(--text-primary)]">{index + 1}. {title}</p>
+            <p className="mt-1 text-xs text-[var(--text-secondary)]">{text}</p>
+          </li>
+        ))}
+      </ol>
+    </section>
   );
 }
 
 function TraceView({
   trace,
-  traceSummary,
   steps,
   results,
   onTraceEventClick,
   onStepClick,
 }) {
   const summaryCards = useMemo(() => {
-    const summary = traceSummary && typeof traceSummary === "object" ? traceSummary : {};
+    const count = (types) => trace.filter((event) => types.includes(String(event?.event_type || ""))).length;
+    const times = trace.map((event) => Date.parse(event?.timestamp || "")).filter((value) => !Number.isNaN(value));
+    const durationMs = times.length > 1 ? Math.max(...times) - Math.min(...times) : 0;
     return [
-      { label: "Total Events", value: Number(summary.total_events || trace.length || 0) },
-      { label: "Step Events", value: Number(summary.step_events || 0) },
-      { label: "Retries", value: Number(summary.retry_events || 0) },
-      { label: "Fallbacks", value: Number(summary.fallback_events || 0) },
-      { label: "Reflections", value: Number(summary.reflection_events || 0) },
-      { label: "Duration", value: formatTraceDuration(summary.total_duration_ms) },
+      { label: "Events", value: trace.length },
+      { label: "Steps finished", value: count(["step_completed", "step_failed"]) },
+      { label: "Retries", value: count(["retry_triggered"]) },
+      { label: "Tool calls", value: count(["tool_called", "tool_failed"]) },
+      { label: "Reflections", value: count(["reflection_completed"]) },
+      { label: "Duration", value: formatTraceDuration(durationMs) },
     ];
-  }, [trace.length, traceSummary]);
+  }, [trace]);
 
   return (
     <div className="space-y-5">
@@ -682,229 +682,12 @@ function TraceView({
   );
 }
 
-function MetricsView({ dashboardMetrics, providerMetrics, agentAssignments, parallelLevels }) {
-  const assignmentCount = Array.isArray(agentAssignments) ? agentAssignments.length : 0;
-  const levelCount = Array.isArray(parallelLevels) ? parallelLevels.length : 0;
-
+function LiveBadge() {
   return (
-    <div className="space-y-5">
-      <section className="rounded-2xl border border-white/10 bg-[var(--bg-card)]/70 p-4 sm:p-5">
-        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
-          <MetricBlurb label="Agent Assignments" value={assignmentCount} />
-          <MetricBlurb label="Parallel Levels" value={levelCount} />
-          <MetricBlurb label="Provider Metrics" value={Object.keys(providerMetrics || {}).length} />
-        </div>
-      </section>
-
-      <MetricsDashboard metrics={dashboardMetrics} providerMetrics={providerMetrics} />
-    </div>
-  );
-}
-
-function SettingsView({ settings, providerDraft, setProviderDraft, isSaving, onPatch }) {
-  const [retryDraft, setRetryDraft] = useState(Number(settings.max_retries || SETTINGS_DEFAULT.max_retries));
-  const [timeoutDraft, setTimeoutDraft] = useState(Number(settings.step_timeout || SETTINGS_DEFAULT.step_timeout));
-
-  useEffect(() => {
-    setRetryDraft(Number(settings.max_retries || SETTINGS_DEFAULT.max_retries));
-  }, [settings.max_retries]);
-
-  useEffect(() => {
-    setTimeoutDraft(Number(settings.step_timeout || SETTINGS_DEFAULT.step_timeout));
-  }, [settings.step_timeout]);
-
-  const handleProviderField = (index, field, value) => {
-    setProviderDraft((previous) => {
-      const next = [...previous];
-      next[index] = {
-        ...(next[index] || {}),
-        [field]: value,
-      };
-      return next;
-    });
-  };
-
-  const addProvider = () => {
-    setProviderDraft((previous) => [
-      ...previous,
-      { provider: "openai", model: "", label: `Fallback ${previous.length + 1}` },
-    ]);
-  };
-
-  const removeProvider = (index) => {
-    setProviderDraft((previous) => previous.filter((_, itemIndex) => itemIndex !== index));
-  };
-
-  const moveProvider = (index, direction) => {
-    setProviderDraft((previous) => {
-      const target = index + direction;
-      if (target < 0 || target >= previous.length) {
-        return previous;
-      }
-      const next = [...previous];
-      const [entry] = next.splice(index, 1);
-      next.splice(target, 0, entry);
-      return next;
-    });
-  };
-
-  return (
-    <div className="space-y-5">
-      <section className="rounded-2xl border border-white/10 bg-[var(--bg-card)]/70 p-4 sm:p-5">
-        <h2 className="text-lg font-semibold text-[var(--text-primary)]">Execution Strategy</h2>
-        <p className="mt-1 text-xs text-[var(--text-secondary)]">Runtime reliability controls are persisted locally and synced to backend when supported.</p>
-
-        <div className="mt-4 grid gap-3 md:grid-cols-3">
-          <ToggleCard
-            title="Chaos Mode"
-            description="Inject random faults to validate recovery behavior."
-            enabled={Boolean(settings.chaos_mode)}
-            onToggle={(value) => onPatch({ chaos_mode: value })}
-          />
-
-          <ToggleCard
-            title="Parallel Mode"
-            description="Allow independent steps to run in parallel lanes."
-            enabled={Boolean(settings.parallel_mode)}
-            onToggle={(value) => onPatch({ parallel_mode: value })}
-          />
-
-          <ToggleCard
-            title="Multi-Agent Mode"
-            description="Route each step to a specialist agent profile."
-            enabled={Boolean(settings.multi_agent_mode)}
-            onToggle={(value) => onPatch({ multi_agent_mode: value })}
-          />
-        </div>
-      </section>
-
-      <section className="rounded-2xl border border-white/10 bg-[var(--bg-card)]/70 p-4 sm:p-5">
-        <h2 className="text-lg font-semibold text-[var(--text-primary)]">Guardrails</h2>
-
-        <div className="mt-4 grid gap-4 lg:grid-cols-2">
-          <SliderCard
-            label="Max Retries"
-            value={retryDraft}
-            min={0}
-            max={8}
-            step={1}
-            suffix="attempts"
-            onChange={setRetryDraft}
-            onCommit={(value) => onPatch({ max_retries: value })}
-          />
-
-          <SliderCard
-            label="Step Timeout"
-            value={timeoutDraft}
-            min={15}
-            max={240}
-            step={5}
-            suffix="seconds"
-            onChange={setTimeoutDraft}
-            onCommit={(value) => onPatch({ step_timeout: value })}
-          />
-        </div>
-      </section>
-
-      <section className="rounded-2xl border border-white/10 bg-[var(--bg-card)]/70 p-4 sm:p-5">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <h2 className="text-lg font-semibold text-[var(--text-primary)]">Provider Fallback Chain</h2>
-            <p className="text-xs text-[var(--text-secondary)]">Order determines automatic failover precedence.</p>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={addProvider}
-              className="rounded-lg border border-white/15 bg-white/5 px-3 py-1.5 text-xs text-[var(--text-secondary)] transition hover:border-sky-400/40 hover:text-[var(--text-primary)]"
-            >
-              Add Provider
-            </button>
-            <button
-              type="button"
-              onClick={() => onPatch({ providers: providerDraft })}
-              disabled={isSaving}
-              className="rounded-lg border border-emerald-400/45 bg-emerald-500/20 px-3 py-1.5 text-xs font-medium text-emerald-100 transition hover:bg-emerald-500/30 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {isSaving ? "Saving..." : "Save Chain"}
-            </button>
-          </div>
-        </div>
-
-        <div className="mt-4 space-y-3">
-          {providerDraft.map((entry, index) => (
-            <div key={`${entry.provider}-${entry.model}-${index}`} className="rounded-xl border border-white/10 bg-white/5 p-3">
-              <div className="grid gap-2 lg:grid-cols-[150px_minmax(0,1fr)_minmax(0,1fr)_auto]">
-                <select
-                  value={String(entry.provider || "")}
-                  onChange={(event) => handleProviderField(index, "provider", event.target.value)}
-                  className="rounded-lg border border-white/15 bg-[#0f1a36] px-3 py-2 text-sm text-[var(--text-primary)] outline-none transition focus:border-sky-400/45"
-                >
-                  <option value="openai">openai</option>
-                  <option value="anthropic">anthropic</option>
-                  <option value="custom">custom</option>
-                </select>
-
-                <input
-                  value={String(entry.model || "")}
-                  onChange={(event) => handleProviderField(index, "model", event.target.value)}
-                  placeholder="model name"
-                  className="rounded-lg border border-white/15 bg-[#0f1a36] px-3 py-2 text-sm text-[var(--text-primary)] outline-none transition focus:border-sky-400/45"
-                />
-
-                <input
-                  value={String(entry.label || "")}
-                  onChange={(event) => handleProviderField(index, "label", event.target.value)}
-                  placeholder="label"
-                  className="rounded-lg border border-white/15 bg-[#0f1a36] px-3 py-2 text-sm text-[var(--text-primary)] outline-none transition focus:border-sky-400/45"
-                />
-
-                <div className="flex items-center justify-end gap-1">
-                  <button
-                    type="button"
-                    onClick={() => moveProvider(index, -1)}
-                    className="rounded border border-white/20 bg-white/5 px-2 py-1 text-xs text-[var(--text-secondary)] transition hover:text-[var(--text-primary)]"
-                  >
-                    ↑
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => moveProvider(index, 1)}
-                    className="rounded border border-white/20 bg-white/5 px-2 py-1 text-xs text-[var(--text-secondary)] transition hover:text-[var(--text-primary)]"
-                  >
-                    ↓
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => removeProvider(index)}
-                    className="rounded border border-red-400/40 bg-red-500/15 px-2 py-1 text-xs text-red-100 transition hover:bg-red-500/25"
-                  >
-                    Remove
-                  </button>
-                </div>
-              </div>
-            </div>
-          ))}
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function QuickMetricsPanel({ metricsSummary }) {
-  return (
-    <section className="rounded-2xl border border-white/10 bg-[var(--bg-card)]/70 p-4 sm:p-5">
-      <h2 className="text-lg font-semibold text-[var(--text-primary)]">Quick Metrics</h2>
-      <div className="mt-3 grid grid-cols-2 gap-2">
-        {metricsSummary.map((item) => (
-          <div key={item.label} className="rounded-xl border border-white/10 bg-white/5 px-3 py-2">
-            <p className="text-[11px] uppercase tracking-wide text-[var(--text-secondary)]">{item.label}</p>
-            <p className="mt-1 text-sm font-semibold text-[var(--text-primary)]">{String(item.value)}</p>
-          </div>
-        ))}
-      </div>
-    </section>
+    <span className="inline-flex items-center gap-2 rounded-full border border-emerald-400/40 bg-emerald-500/15 px-3 py-1 text-xs text-emerald-100">
+      <span className="running-pulse h-2 w-2 rounded-full bg-emerald-300" />
+      Live
+    </span>
   );
 }
 
@@ -917,89 +700,17 @@ function StatusBadge({ status, statusMeta }) {
   );
 }
 
-function ConnectionBadge({ isConnected }) {
-  return (
-    <span className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs ${isConnected
-      ? "border-emerald-400/40 bg-emerald-500/20 text-emerald-100"
-      : "border-rose-400/40 bg-rose-500/20 text-rose-100"}`}>
-      <span className={`h-2.5 w-2.5 rounded-full ${isConnected ? "bg-emerald-300" : "bg-rose-300"}`} />
-      {isConnected ? "🟢 Connected" : "🔴 Disconnected"}
-    </span>
-  );
-}
-
-function MetaBadge({ value }) {
-  return (
-    <span className="inline-flex items-center rounded-full border border-white/15 bg-white/5 px-3 py-1 text-xs text-[var(--text-secondary)]">
-      {String(value)}
-    </span>
-  );
-}
-
-function MetricBlurb({ label, value }) {
-  return (
-    <div className="rounded-xl border border-white/10 bg-white/5 px-3 py-2">
-      <p className="text-[11px] uppercase tracking-wide text-[var(--text-secondary)]">{label}</p>
-      <p className="mt-1 text-sm font-semibold text-[var(--text-primary)]">{String(value)}</p>
-    </div>
-  );
-}
-
-function ToggleCard({ title, description, enabled, onToggle }) {
-  return (
-    <div className="rounded-xl border border-white/10 bg-white/5 p-3">
-      <div className="flex items-center justify-between gap-3">
-        <div>
-          <p className="text-sm font-medium text-[var(--text-primary)]">{title}</p>
-          <p className="text-xs text-[var(--text-secondary)]">{description}</p>
-        </div>
-
-        <button
-          type="button"
-          onClick={() => onToggle(!enabled)}
-          className={`relative inline-flex h-7 w-14 items-center rounded-full border transition ${enabled
-            ? "border-emerald-400/55 bg-emerald-500/30"
-            : "border-slate-400/30 bg-slate-700/40"}`}
-        >
-          <span
-            className={`absolute h-5 w-5 rounded-full bg-white transition ${enabled ? "translate-x-8" : "translate-x-1"}`}
-          />
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function SliderCard({ label, value, min, max, step, suffix, onChange, onCommit }) {
-  return (
-    <div className="rounded-xl border border-white/10 bg-white/5 p-3">
-      <div className="mb-2 flex items-center justify-between">
-        <p className="text-sm font-medium text-[var(--text-primary)]">{label}</p>
-        <p className="text-xs text-[var(--text-secondary)]">
-          {value} {suffix}
-        </p>
-      </div>
-
-      <input
-        type="range"
-        min={min}
-        max={max}
-        step={step}
-        value={value}
-        onChange={(event) => onChange(Number(event.target.value))}
-        onMouseUp={(event) => onCommit(Number(event.currentTarget.value))}
-        onTouchEnd={(event) => onCommit(Number(event.currentTarget.value))}
-        className="w-full accent-sky-400"
-      />
-    </div>
-  );
-}
-
 function deriveExecutionStatus({ task, isLoading, hasTaskStarted }) {
   const status = String(task?.status || "").toLowerCase();
 
-  if (status === "completed" || status === "failed") {
+  if (status === "completed") {
     return "Complete";
+  }
+  if (status === "failed") {
+    return "Failed";
+  }
+  if (status === "planned" && !isLoading) {
+    return "Plan ready";
   }
   if (isLoading || status === "planning" || status === "planned") {
     return "Planning";
@@ -1236,10 +947,4 @@ function AnimatedBackground() {
       />
     </div>
   );
-}
-
-// Models put <br> inside markdown table cells. Raw HTML from a model is never rendered (XSS), so
-// line-break tags become a visible separator instead.
-function cleanModelMarkdown(text) {
-  return String(text || "").replace(/<br\s*\/?>/gi, " · ");
 }

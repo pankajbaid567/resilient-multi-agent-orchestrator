@@ -52,7 +52,10 @@ export default function StepCard({ step, result = null, index = 0, isActive = fa
 
   const statusMeta = STATUS_META[status];
   const Icon = statusMeta.icon;
-  const toolUsed = result?.tool_used || step?.tool_needed || null;
+  // Show who did the work (the agent) or a real tool call; the planner's "llm_only"/"none" hints
+  // are internal and mean nothing to a reader.
+  const rawTool = result?.tool_used || null;
+  const toolUsed = result?.agent_name || (rawTool && !["llm_only", "none"].includes(rawTool) ? rawTool : null);
   const output = String(result?.output || step?.output || "").trim();
   const outputPreview = output.length > 300 ? `${output.slice(0, 300)}...` : output;
   const tokensUsed = Number(result?.tokens_used || 0);

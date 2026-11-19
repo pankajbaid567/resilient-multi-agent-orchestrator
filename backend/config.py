@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     # Upper bound on planned steps; the planner is asked for the fewest steps that do the task.
     MAX_PLAN_STEPS: int = 6
     GRAPH_RECURSION_LIMIT: int = 0
-    PARALLEL_MODE: bool = False
+    PARALLEL_MODE: bool = True
     MAX_CONCURRENT_STEPS: int = 5
     MULTI_AGENT_MODE: bool = True
     CHAOS_MODE: bool = False

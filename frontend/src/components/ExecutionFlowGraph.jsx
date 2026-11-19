@@ -94,7 +94,7 @@ export default function ExecutionFlowGraph({
           Waiting for execution plan to render flow graph.
         </div>
       ) : (
-        <div className={`overflow-x-auto ${isScrollableY ? "max-h-[820px] overflow-y-auto pr-1" : ""}`}>
+        <div tabIndex={0} role="region" aria-label="Execution graph" className={`overflow-x-auto ${isScrollableY ? "max-h-[820px] overflow-y-auto pr-1" : ""}`}>
           <svg
             viewBox={`0 0 ${graph.width} ${graph.height}`}
             className="min-w-[920px]"

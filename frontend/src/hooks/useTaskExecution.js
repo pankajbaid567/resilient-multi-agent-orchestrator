@@ -215,7 +215,9 @@ export default function useTaskExecution() {
     return response;
   }, [runtimeConfig]);
 
-  const submitTask = useCallback(async (descriptionOrPayload) => {
+  // Plans the task and, unless autoRun is false, starts it. The backend pauses after planning,
+  // so with autoRun=false the UI can show the plan for approval and call runPlannedTask().
+  const submitTask = useCallback(async (descriptionOrPayload, { autoRun = true } = {}) => {
     setIsLoading(true);
     setError(null);
 
@@ -263,6 +265,11 @@ export default function useTaskExecution() {
       setAgentContributions({});
       processedEventsRef.current = 0;
 
+      if (!autoRun) {
+        await refreshTaskSnapshot(currentTaskId);
+        return { success: true, taskId: currentTaskId, planned: true };
+      }
+
       const executeResponse = await executeTask(currentTaskId);
       if (!executeResponse.success) {
         throw new Error(executeResponse.error || "Failed to start task execution");
@@ -287,6 +294,42 @@ export default function useTaskExecution() {
       setIsLoading(false);
     }
   }, [refreshTaskSnapshot]);
+
+  const runPlannedTask = useCallback(async () => {
+    if (!taskId) {
+      return { success: false, error: "No planned task to run" };
+    }
+    setIsLoading(true);
+    setError(null);
+    try {
+      const executeResponse = await executeTask(taskId);
+      if (!executeResponse.success) {
+        throw new Error(executeResponse.error || "Failed to start task execution");
+      }
+      setTask((prev) => ({ ...(prev || {}), status: "executing" }));
+      await refreshTaskSnapshot(taskId);
+      return { success: true, taskId };
+    } catch (runError) {
+      setError(runError?.message || "Could not start the run");
+      return { success: false, error: runError?.message || "Could not start the run" };
+    } finally {
+      setIsLoading(false);
+    }
+  }, [refreshTaskSnapshot, taskId]);
+
+  const resetTask = useCallback(() => {
+    setTaskId(null);
+    setTask(null);
+    setSteps([]);
+    setResults([]);
+    setTrace([]);
+    setTraceSummary(null);
+    setTaskMetrics(null);
+    setParallelLevels([]);
+    setAgentAssignments([]);
+    setAgentContributions({});
+    setError(null);
+  }, []);
 
   useEffect(() => {
     loadRuntimeSettings();
@@ -466,6 +509,8 @@ export default function useTaskExecution() {
     agentContributions,
     metrics,
     submitTask,
+    runPlannedTask,
+    resetTask,
     refreshTaskSnapshot,
     refreshGlobalMetrics,
     updateRuntimeSettings,

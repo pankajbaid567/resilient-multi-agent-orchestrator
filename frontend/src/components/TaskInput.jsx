@@ -3,14 +3,17 @@ import { motion } from "framer-motion";
 
 const MAX_CHARS = 2000;
 
+// Examples that work without live data (the public demo has no web search).
 const EXAMPLE_TASKS = [
-  "Research quantum computing advances",
-  "Compare 5 programming languages",
-  "Analyze AI market trends",
+  "Compare PostgreSQL and MongoDB for an online store's order system, then recommend one.",
+  "Plan a two-week study schedule for a DSA-heavy internship interview.",
+  "Explain how HTTPS keeps a connection secure, step by step, for a beginner.",
+  "Write a short, polite email asking a professor for a recommendation letter.",
 ];
 
 export default function TaskInput({ onSubmit, isLoading = false, onTaskCreated }) {
   const [taskText, setTaskText] = useState("");
+  const [reviewPlan, setReviewPlan] = useState(true);
   const [error, setError] = useState("");
 
   const submitHandler = onSubmit || onTaskCreated;
@@ -46,7 +49,7 @@ export default function TaskInput({ onSubmit, isLoading = false, onTaskCreated }
       return;
     }
 
-    const response = await Promise.resolve(submitHandler(trimmedTask));
+    const response = await Promise.resolve(submitHandler(trimmedTask, { autoRun: !reviewPlan }));
     if (response?.success === false) {
       setError(response.error || "Failed to submit task.");
       return;
@@ -67,14 +70,14 @@ export default function TaskInput({ onSubmit, isLoading = false, onTaskCreated }
     <form className="space-y-4" onSubmit={handleSubmit}>
       <div>
         <label className="mb-2 block text-sm font-medium text-[var(--text-primary)]" htmlFor="task-input">
-          Task Brief
+          What should the agents do?
         </label>
         <div className="glass rounded-2xl border border-white/10 bg-[var(--bg-card)]/70 p-3">
           <textarea
             id="task-input"
             className="h-36 w-full resize-none rounded-xl border border-white/10 bg-[#0e1733]/80 px-4 py-3 text-sm text-[var(--text-primary)] outline-none transition focus:border-[var(--accent-secondary)] focus:ring-2 focus:ring-[var(--accent-secondary)]/30"
             maxLength={MAX_CHARS}
-            placeholder="Describe your task... e.g., 'Research the top 5 AI startups funded in 2025 and compare their valuations'"
+            placeholder="Describe a task, e.g. 'Compare renting and buying a flat in Pune for a 26-year-old engineer and recommend one.'"
             value={taskText}
             onChange={(event) => setTaskText(event.target.value)}
           />
@@ -89,7 +92,7 @@ export default function TaskInput({ onSubmit, isLoading = false, onTaskCreated }
       </div>
 
       <div>
-        <p className="mb-2 text-xs uppercase tracking-wide text-[var(--text-secondary)]">Quick examples</p>
+        <p className="mb-2 text-xs uppercase tracking-wide text-[var(--text-secondary)]">Try an example</p>
         <div className="flex flex-wrap gap-2">
           {EXAMPLE_TASKS.map((task) => (
             <button
@@ -104,6 +107,16 @@ export default function TaskInput({ onSubmit, isLoading = false, onTaskCreated }
           ))}
         </div>
       </div>
+
+      <label className="flex cursor-pointer items-center gap-2 text-xs text-[var(--text-secondary)]">
+        <input
+          type="checkbox"
+          checked={reviewPlan}
+          onChange={(event) => setReviewPlan(event.target.checked)}
+          className="h-4 w-4 rounded border-white/30 bg-transparent accent-sky-400"
+        />
+        Show me the plan before it runs
+      </label>
 
       <motion.button
         type="submit"
@@ -121,7 +134,7 @@ export default function TaskInput({ onSubmit, isLoading = false, onTaskCreated }
             Planning...
           </>
         ) : (
-          "Plan & Execute"
+          reviewPlan ? "Plan task" : "Plan and run"
         )}
       </motion.button>
     </form>
