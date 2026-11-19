@@ -394,12 +394,16 @@ export default function useTaskExecution() {
 
     const totalTokens = Number(task?.llm_tokens_used || 0) || results.reduce((sum, item) => sum + Number(item?.tokens_used || 0), 0);
 
+    // Cost comes from the backend (recorded tokens x configured model prices). No client-side
+    // guess: an unpriced run shows 0 rather than an invented figure.
     const estimatedCost = Number(
       baseMetrics?.total_cost_usd ||
       task?.final_output?.summary?.estimated_cost_usd ||
+      task?.final_output?.summary?.llm_usage?.cost_usd ||
+      baseMetrics?.estimated_cost_usd ||
       0,
     );
-    const fallbackEstimatedCost = estimatedCost > 0 ? estimatedCost : Number((totalTokens / 1_000_000) * 3.5).toFixed(6);
+    const fallbackEstimatedCost = estimatedCost;
 
     const startedAt = task?.started_at ? new Date(task.started_at).getTime() : null;
     const completedAt = task?.completed_at ? new Date(task.completed_at).getTime() : null;

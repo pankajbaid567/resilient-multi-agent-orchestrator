@@ -10,7 +10,7 @@ A multi-step, multi-agent task runner built on **LangGraph** that keeps working 
 
 ## Live demo
 
-- **UI:** https://reliable-agent-frontend-emlv.onrender.com
+- **UI:** https://reliable-agent.pages.dev (Cloudflare Pages)
 - **API:** https://3-109-36-90.sslip.io (`/docs` for the API reference)
 
 The backend runs on AWS EC2 (`t4g.micro`, Mumbai) and calls Amazon Bedrock with the instance's IAM role. The app turns the role's credentials into a short-term Bedrock key and refreshes it, so no API key is stored anywhere. Setup and cost are in [deploy/aws-ec2](deploy/aws-ec2/README.md). A full task costs about $0.003–0.005 in model tokens.

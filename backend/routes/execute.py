@@ -175,6 +175,9 @@ async def _run_execution(task_id: str) -> None:
                 "data": {
                     "status": final_state.get("status"),
                     "current_step_index": final_state.get("current_step_index"),
+                    # The UI shows these in its completion notice without waiting for a state refresh.
+                    "confidence": final_state.get("confidence_score"),
+                    "summary": (final_state.get("final_output") or {}).get("summary"),
                 },
             },
         )
