@@ -13,7 +13,7 @@ A multi-step, multi-agent task runner built on **LangGraph** that keeps working 
 - **UI:** https://reliable-agent.pages.dev (Cloudflare Pages)
 - **API:** https://3-109-36-90.sslip.io (`/docs` for the API reference)
 
-The backend runs on AWS EC2 (`t4g.micro`, Mumbai) and calls Amazon Bedrock with the instance's IAM role. The app turns the role's credentials into a short-term Bedrock key and refreshes it, so no API key is stored anywhere. Setup and cost are in [deploy/aws-ec2](deploy/aws-ec2/README.md). A full task costs about $0.003–0.005 in model tokens.
+The backend runs on AWS EC2 (`t4g.small`, Mumbai) and calls Amazon Bedrock with the instance's IAM role. The app turns the role's credentials into a short-term Bedrock key and refreshes it, so no API key is stored anywhere. Setup and cost are in [deploy/aws-ec2](deploy/aws-ec2/README.md). A full task costs about $0.003–0.005 in model tokens.
 
 ## The UI
 
@@ -181,7 +181,7 @@ Endpoints that change process-wide settings need `X-Admin-Key`, so a public depl
 ## Limits
 
 - **The live eval is AI-graded** by one model on 40 tasks with three rubric points each. It is a comparison between systems, not a human-validated quality score. The v2 fixes were made after seeing v1 on the same tasks, so v2 is not an independent held-out result.
-- **The demo runs on one small instance**: a `t4g.micro` in `ap-south-1`, with in-memory circuit breakers and SQLite checkpoints, and at most 4 parallel steps per wave. It is limited to 5 tasks per IP per hour and 50 per day, and an AWS Budget alert fires at $5. It is a demo, not a production deployment.
+- **The demo runs on one small instance**: a `t4g.small` in `ap-south-1`, with in-memory circuit breakers and SQLite checkpoints, and at most 4 parallel steps per wave. It is limited to 5 tasks per IP per hour and 50 per day, and an AWS Budget alert fires at $5. It is a demo, not a production deployment.
 - **Python execution is not sandboxed**: there is no network isolation. Keep `ENABLE_CODE_EXEC=false` anywhere untrusted users can submit tasks.
 - **Resume granularity is one step.** A step that was running when the process died runs again from its start. Its model calls are not idempotent, so they are repeated (and paid for again).
 - **The in-memory checkpointer** (the default) loses runs on restart. Use SQLite or Postgres to resume across restarts.
