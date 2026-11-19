@@ -1,68 +1,42 @@
-# Hackathon Demo Script (5 Minutes)
+# Demo script (5 minutes)
 
-## Objective
-Deliver a fast, convincing walkthrough that proves the agent is both capable and reliable under real execution uncertainty.
+Goal: show that the system plans, runs agents in parallel, checks its own work, and keeps answering
+when models fail, and be honest about where that machinery pays off.
 
-## Pre-Demo Setup (Before Going On Stage)
-1. Start services: `docker compose up --build`.
-2. Open frontend dashboard: `http://localhost:5173`.
-3. Confirm backend health once: `http://localhost:8000/health`.
-4. Keep [scenarios.json](scenarios.json) open for quick copy/paste.
-5. Keep one completed run in history if possible for instant fallback storytelling.
+## Before you start
 
-## Run of Show (Total 5:00)
+- Live UI: https://reliable-agent.pages.dev (API: https://3-109-36-90.sslip.io/docs).
+- The public demo allows 5 runs per visitor per hour. Do one warm-up run, not five.
+- The public demo has no web search and no code execution, so use tasks that do not need live data
+  (see [scenarios.json](scenarios.json)).
+- Chaos mode (fault injection) is admin-only on the public demo. To show recovery live, run locally:
+  `CHAOS_MODE=true uvicorn main:app` in `backend/`, or show the simulated eval table in the README.
 
-| Time | What To Say | What To Click | What To Point Out |
-| --- | --- | --- | --- |
-| 0:00-0:30 | "This is a reliability-first AI agent, not just a single prompt response app." | Show dashboard header and status badge. | Sticky status, chaos toggle, and live observability panels. |
-| 0:30-1:50 | "First, a clean happy-path research task to show planning and synthesis quality." | Paste Happy Path input and submit. | Step decomposition in DAG, live logs, and trace events updating in real time. |
-| 1:50-2:50 | "Now we deliberately inject faults with Chaos Mode to prove retry and fallback behavior." | Turn Chaos Mode ON. Paste Failure Recovery input and submit. | Retry events, fallback transitions, and continued forward progress despite injected issues. |
-| 2:50-3:50 | "Finally, a code-heavy task where quality matters and reflection can self-correct." | Turn Chaos Mode OFF. Paste Reflection Demo input and submit. | Validation/reflect signals in timeline and improved downstream output quality. |
-| 3:50-4:30 | "The result modal gives final synthesis, confidence, and a downloadable trace artifact." | Open final result panel/modal. Click Download trace JSON. | Confidence badge, execution summary, and auditability. |
-| 4:30-5:00 | "Same architecture handles both best-case throughput and worst-case turbulence." | Return to main layout, briefly show all panes. | Reliability story: plan, execute, recover, explain. |
+## Run of show
 
-## Scenario-Specific Narration Cues
+| Time | Say | Do | Point at |
+|---|---|---|---|
+| 0:00–0:30 | "A task runner on LangGraph: plan, run specialist agents, review every answer, recover from model failures. API on EC2, models on Amazon Bedrock through the instance's IAM role, no stored keys." | Open the UI, open *About this demo*. | Architecture in two sentences. |
+| 0:30–1:30 | "First it only plans. Nothing runs until I approve it." | Paste scenario 1, keep *Show me the plan before it runs* ticked, click *Plan task*. | Steps, waves (what runs in parallel), dependencies. |
+| 1:30–2:30 | "Steps in the same wave run at the same time. Each answer is checked by a reviewer model." | Click *Run plan*. | Live graph: agent and model per step; live log. |
+| 2:30–3:15 | "The answer, with what it cost." | Wait for the answer card. | Outcome, confidence, time, model calls, tokens, cost (about $0.003). |
+| 3:15–4:00 | "Every number comes from recorded model calls." | Open *Metrics*, then *Trace*. | Calls by role (planner, agents, reviewer, finalizer), latency p50/p95, per-step table; event waterfall. |
+| 4:00–4:40 | "Where does it pay off? Not on quality: on 40 tasks it ties a single call and costs about 3x. Under provider failures it keeps answering." | Show the README eval tables (simulated and live). | Outage: single call 0% answered, full system 100%. |
+| 4:40–5:00 | "Built for failure: retries, fallback models, circuit breakers, checkpoints, budgets, and an honest eval." | Back to the Run tab. | Close. |
 
-### 1) Happy Path
-1. Say: "Notice how one broad prompt is decomposed into clear operational steps."
-2. Say: "Web search and synthesis are chained, not blended into one fragile call."
-3. Say: "The final report quality is a product of orchestrated steps, not luck."
+## If something goes wrong
 
-### 2) Failure Recovery
-1. Say: "This run has Chaos Mode enabled, so failures are expected by design."
-2. Say: "Retries and fallback are automatic; the user does not babysit execution."
-3. Say: "Even degraded runs still produce useful output with visible reliability telemetry."
+- **429 Too Many Requests:** the per-visitor limit (5/hour) is hit. Show a run from the local stack instead.
+- **Slow plan:** narrate the plan-approval pause while it loads; planning is one model call.
+- **A step fails review:** good, show it. The step gets retried with the reviewer's feedback, or the
+  reflector rewrites, splits or skips it; the answer card then says *partial*.
 
-### 3) Reflection Demo
-1. Say: "For code tasks, correctness matters more than first-attempt fluency."
-2. Say: "When validation is weak, reflection adapts the plan or step definition."
-3. Say: "The timeline gives a transparent why behind every correction."
+## Likely questions
 
-## Backup Plans (If Something Goes Wrong Live)
-
-### Backup for Happy Path
-If planning latency is high, narrate the architecture while the DAG appears, then switch to a previously completed run and show the result + trace timeline.
-
-### Backup for Failure Recovery
-If no retries appear quickly, keep Chaos Mode ON and rerun once. If still clean, explain probabilistic injection and show existing retry/fallback events from a stored prior run.
-
-### Backup for Reflection Demo
-If reflection does not trigger naturally, use a slightly stricter follow-up prompt such as "include edge-case delete behavior and failing test analysis" and narrate the validation-first path.
-
-## Fast Demo Control Tips
-1. If you are behind schedule, skip waiting for full completion and focus on live events + one completed result card.
-2. Keep one hand on Chaos Mode and one on tabs (Execution/Trace) to steer the story quickly.
-3. Use the logs panel for quick proof and timeline panel for deep proof.
-
-## Q&A Preparation (Top 5)
-
-| Question | Suggested Answer |
-| --- | --- |
-| How is this different from a normal chatbot? | "A chatbot usually does one-shot generation. This system plans tasks, executes step-by-step, validates quality, retries/fallbacks on failure, and exposes traceability for every decision." |
-| What happens when providers fail repeatedly? | "Retries are attempted with backoff, then fallback providers are used. If all providers fail, the task still records structured failure state and trace metadata for recovery and diagnosis." |
-| How do you prevent silent failures? | "Every step emits execution events and trace entries. Failures are explicit in timeline/logs, and confidence + summary are attached to final outputs." |
-| Can this run in production with compliance requirements? | "Yes. It already produces auditable traces, checkpointed state, and deterministic reliability hooks. Governance controls can be layered on top of this observable execution model." |
-| How do you test resilience, not just happy paths? | "Chaos mode injects latency, empty responses, rate limits, and corrupt outputs. We use it to validate retry, fallback, and recovery logic under controlled failure conditions." |
-
-## Closing Line
-"This demo shows an agent that does not just answer, it executes responsibly: it plans, monitors itself, recovers from faults, and explains what happened."
+| Question | Answer |
+|---|---|
+| How is this different from one prompt? | It plans, runs steps with the right agent, reviews each answer and recovers from failures. On quality alone it ties one call with a strong model; the gain is reliability under failures, at about 3x the cost. |
+| What happens when a model is down? | Retries with backoff, then the next model in the chain; a circuit breaker stops calling a failing model. Every role goes through this, including the planner and the reviewer. |
+| What if the process dies mid-run? | State is checkpointed after every wave; `POST /tasks/{id}/resume` re-runs only the unfinished steps. |
+| How do you know the tests test anything? | 101 tests with a scripted fake model, and a mutation check: 14 injected bugs, 14 caught. |
+| How do you stop runaway cost? | A token budget and a deadline per task, rate limits per visitor and per day, and an AWS Budget alert. |

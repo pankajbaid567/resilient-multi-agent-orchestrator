@@ -3,7 +3,7 @@
 A multi-step, multi-agent task runner built on **LangGraph** that keeps working when models fail. A planner splits a task into a dependency graph of steps. A supervisor hands each step to a specialist agent (research, code, analysis, writing) that runs a ReAct loop with its own tools. Every answer is validated, and failing steps are retried with the reviewer's feedback or repaired by a reflector. Model calls go through retries, a fallback chain of models and per-model circuit breakers. Run state is checkpointed after every wave of steps, so an interrupted run resumes where it stopped.
 
 **What is measured, and how:**
-- **98 deterministic unit tests** run against a scripted fake model: no network, no Redis, no keys.
+- **101 deterministic unit tests** run against a scripted fake model: no network, no Redis, no keys.
 - **A mutation check** injects 14 bugs into the core logic, and the tests catch 14 of 14 ([details and history](docs/mutation-results.md)).
 - **A reproducible eval** runs 1,080 times on a *simulated* model with injected faults ([report](backend/eval/results/simulated.md)). It measures recovery, not answer quality.
 - **A live eval on Amazon Bedrock** compares the full system with a single model call on 40 tasks, AI-graded. The first version lost clearly; after the fixes it found, the two tie on quality and the full system costs about 3x ([below](#live-eval-amazon-bedrock)).
@@ -14,6 +14,19 @@ A multi-step, multi-agent task runner built on **LangGraph** that keeps working 
 - **API:** https://3-109-36-90.sslip.io (`/docs` for the API reference)
 
 The backend runs on AWS EC2 (`t4g.micro`, Mumbai) and calls Amazon Bedrock with the instance's IAM role. The app turns the role's credentials into a short-term Bedrock key and refreshes it, so no API key is stored anywhere. Setup and cost are in [deploy/aws-ec2](deploy/aws-ec2/README.md). A full task costs about $0.003–0.005 in model tokens.
+
+## The UI
+
+The dashboard (React, Vite, Tailwind) follows a run from plan to answer:
+
+- **Run**: you describe a task and get the **proposed plan** first: its steps, which ones run together (waves) and their dependencies. Nothing runs until you click *Run plan*, or you start over. This is the backend's plan-approval pause made visible. Unticking *Show me the plan before it runs* plans and runs in one go.
+- While it runs, a live graph shows each step's status, agent, model and retries, and a log streams the events over WebSocket.
+- The **answer** comes first when the run ends, with its outcome (all steps passed review, or partial), confidence, time, model calls, tokens and cost, and a copy button.
+- **Trace**: timeline and waterfall of every event; the counts are computed from the events.
+- **Metrics**: only numbers recorded for this run: calls and tokens by role and by model, latency p50/p95, output speed, retries and fallbacks, and a per-step table. Server totals are labelled as "since the backend started". There is no sample or estimated data; a missing value shows as "—".
+- **Configuration**: the server's settings and model fallback chain, read-only (changing them needs the admin key), plus the public demo's limits.
+
+Charts and the step-detail view are loaded only when opened, so the first page load is about 38 KB of JavaScript (gzip). An axe check (WCAG 2 A and AA rules) reports no violations on the home page and on a finished run.
 
 ## How it works
 
@@ -48,7 +61,7 @@ Both diagrams match the compiled graphs (`build_graph(...).get_graph().draw_merm
 
 | Concern | How it is handled | Where |
 |---|---|---|
-| Parallel steps | The scheduler sends every step whose dependencies have finished, through LangGraph `Send` (one per wave when `PARALLEL_MODE=false`). Reducers merge the logs of concurrent steps. | `agent/graph.py`, `agent/state.py` |
+| Parallel steps | On by default (`PARALLEL_MODE=true`). The scheduler sends every step whose dependencies have finished, up to `MAX_CONCURRENT_STEPS` per wave, through LangGraph `Send`; with `PARALLEL_MODE=false` it sends one per wave. Reducers merge the logs of concurrent steps. | `agent/graph.py`, `agent/state.py` |
 | Resume | The LangGraph checkpointer saves state after every super-step (thread = task id). A crashed run re-runs only the steps that had not finished. Backends: memory, SQLite, or Postgres (for example free Neon). | `agent/checkpointing.py` |
 | Human in the loop | The run pauses after planning. `POST /tasks` returns the plan, and `POST /tasks/{id}/execute` approves it and continues. | `interrupt_after=["planner"]` |
 | Multi-agent | The supervisor model picks the specialist and writes its brief, with deterministic rules as fallback. Workers run a text-protocol ReAct loop with only the tools their role allows and the deployment can run. Observations invented by the model are discarded. | `agent/multi_agent/` |
@@ -168,7 +181,7 @@ Endpoints that change process-wide settings need `X-Admin-Key`, so a public depl
 ## Limits
 
 - **The live eval is AI-graded** by one model on 40 tasks with three rubric points each. It is a comparison between systems, not a human-validated quality score. The v2 fixes were made after seeing v1 on the same tasks, so v2 is not an independent held-out result.
-- **The demo runs on one small instance**: a `t4g.micro` in `ap-south-1`, with in-memory circuit breakers and SQLite checkpoints. It is limited to 5 tasks per IP per hour and 50 per day, and an AWS Budget alert fires at $5. It is a demo, not a production deployment.
+- **The demo runs on one small instance**: a `t4g.micro` in `ap-south-1`, with in-memory circuit breakers and SQLite checkpoints, and at most 4 parallel steps per wave. It is limited to 5 tasks per IP per hour and 50 per day, and an AWS Budget alert fires at $5. It is a demo, not a production deployment.
 - **Python execution is not sandboxed**: there is no network isolation. Keep `ENABLE_CODE_EXEC=false` anywhere untrusted users can submit tasks.
 - **Resume granularity is one step.** A step that was running when the process died runs again from its start. Its model calls are not idempotent, so they are repeated (and paid for again).
 - **The in-memory checkpointer** (the default) loses runs on restart. Use SQLite or Postgres to resume across restarts.
@@ -189,8 +202,10 @@ backend/
   services/                 LLM client, usage records, LLM metrics, Redis streams
   eval/                     tasks, simulator, runner, report, results
   scripts/mutation_check.py
-  tests/unit/               98 tests with a scripted fake model
-frontend/                   React + Vite dashboard
+  tests/unit/               101 tests with a scripted fake model
+frontend/src/App.jsx        tabs: Run, Trace, Metrics, Configuration
+frontend/src/components/    PlanReview, ResultCard, ExecutionFlowGraph, RunMetrics, ConfigView, ...
+frontend/src/hooks/         useTaskExecution (plan, run, polling), useWebSocket (live events)
 ```
 
 ## License
