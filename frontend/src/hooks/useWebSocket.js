@@ -21,7 +21,10 @@ export default function useWebSocket(taskId) {
     if (!taskId) {
       return null;
     }
-    return `ws://localhost:8000/ws/${taskId}`;
+    // Derive the socket URL from the API URL (https -> wss), so the deployed UI streams from the
+    // deployed backend instead of a hardcoded localhost.
+    const apiBase = String(import.meta.env.VITE_API_URL || "http://localhost:8000").replace(/\/+$/, "");
+    return `${apiBase.replace(/^http/, "ws")}/ws/${taskId}`;
   }, [taskId]);
 
   useEffect(() => {
