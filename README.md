@@ -8,6 +8,13 @@ A multi-step, multi-agent task runner built on **LangGraph** that keeps working 
 - **A reproducible eval** runs 1,080 times on a *simulated* model with injected faults ([report](backend/eval/results/simulated.md)). It measures recovery, not answer quality.
 - **A live eval on Amazon Bedrock** compares the full system with a single model call on 40 tasks, AI-graded. The first version lost clearly; after the fixes it found, the two tie on quality and the full system costs about 3x ([below](#live-eval-amazon-bedrock)).
 
+## Live demo
+
+- **UI:** https://reliable-agent-frontend-emlv.onrender.com
+- **API:** https://3-109-36-90.sslip.io (`/docs` for the API reference)
+
+The backend runs on AWS EC2 (`t4g.micro`, Mumbai) and calls Amazon Bedrock with the instance's IAM role. The app turns the role's credentials into a short-term Bedrock key and refreshes it, so no API key is stored anywhere. Setup and cost are in [deploy/aws-ec2](deploy/aws-ec2/README.md). A full task costs about $0.003–0.005 in model tokens.
+
 ## How it works
 
 ```mermaid
@@ -161,7 +168,7 @@ Endpoints that change process-wide settings need `X-Admin-Key`, so a public depl
 ## Limits
 
 - **The live eval is AI-graded** by one model on 40 tasks with three rubric points each. It is a comparison between systems, not a human-validated quality score. The v2 fixes were made after seeing v1 on the same tasks, so v2 is not an independent held-out result.
-- **The public demo does not answer yet.** It still points at the Hugging Face router, whose free credits ran out (HTTP 402). The Bedrock runs used a short-term key from a local login. A hosted demo needs a long-lived credential set by the owner.
+- **The demo runs on one small instance**: a `t4g.micro` in `ap-south-1`, with in-memory circuit breakers and SQLite checkpoints. It is limited to 5 tasks per IP per hour and 50 per day, and an AWS Budget alert fires at $5. It is a demo, not a production deployment.
 - **Python execution is not sandboxed**: there is no network isolation. Keep `ENABLE_CODE_EXEC=false` anywhere untrusted users can submit tasks.
 - **Resume granularity is one step.** A step that was running when the process died runs again from its start. Its model calls are not idempotent, so they are repeated (and paid for again).
 - **The in-memory checkpointer** (the default) loses runs on restart. Use SQLite or Postgres to resume across restarts.
