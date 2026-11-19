@@ -33,9 +33,13 @@ class Settings(BaseSettings):
     MODEL_CHAIN: str = ""
     # Some endpoints reject an explicit temperature for certain models; set false to omit it.
     LLM_SEND_TEMPERATURE: bool = True
+    # Optional reasoning effort for reasoning models (low|medium|high), sent as reasoning_effort.
+    LLM_REASONING_EFFORT: str = ""
     MAX_RETRIES: int = 3
     STEP_TIMEOUT: int = 60
     MAX_STEPS: int = 15
+    # Upper bound on planned steps; the planner is asked for the fewest steps that do the task.
+    MAX_PLAN_STEPS: int = 6
     GRAPH_RECURSION_LIMIT: int = 0
     PARALLEL_MODE: bool = False
     MAX_CONCURRENT_STEPS: int = 5

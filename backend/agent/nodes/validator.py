@@ -10,6 +10,7 @@ from typing import Any
 
 from config import get_settings
 from agent.reliability.fallback import complete
+from services.json_extract import extract_json_object
 from services.llm_service import LLMError
 
 logger = logging.getLogger(__name__)
@@ -105,6 +106,7 @@ async def judge_output(step_name: str, step_description: str, output: str) -> Ju
         return Judgement("retry", f"Output is too short ({len(text)} characters) to complete the step.", {},
                          "deterministic")
 
+    response = None
     try:
         response = await complete(
             preferred_model=_get_validation_model(),
@@ -115,24 +117,26 @@ async def judge_output(step_name: str, step_description: str, output: str) -> Ju
             ),
             system_prompt=VALIDATOR_SYSTEM_PROMPT,
             temperature=0.1,
-            max_tokens=400,
-            json_mode=True,
+            max_tokens=1500,  # reasoning models spend part of the budget before answering
+            # The prompt asks for JSON and the parser extracts it; provider JSON modes added
+            # artefacts (a doubled opening brace from Bedrock gpt-oss).
+            json_mode=False,
             timeout=45,
         )
         parsed = _parse_validation_response(response.text)
         return Judgement(parsed["verdict"], parsed["reason"], parsed["scores"], "llm")
     except (LLMError, ValueError, json.JSONDecodeError) as exc:
-        logger.warning("judge_unavailable step=%s error=%s", step_name, exc)
+        logger.warning("judge_unavailable step=%s error=%s raw=%r", step_name, exc,
+                       (response.text[:160] if response is not None else None))
         fallback = rule_based_validate(output=text, step_description=step_description)
         return Judgement(str(fallback["verdict"]), str(fallback["reason"]), {}, "rules")
 
 
 def _parse_validation_response(raw_text: str) -> dict[str, Any]:
     """Parse validator JSON output and normalize verdict, reason, and scores."""
-    payload = _extract_json_payload(raw_text)
-    parsed = json.loads(payload)
+    parsed = extract_json_object(raw_text)
     if not isinstance(parsed, dict):
-        raise ValueError("Validator response must be a JSON object")
+        raise ValueError("Validator response did not contain a JSON object")
 
     verdict = str(parsed.get("verdict", "")).strip().lower()
     reason = str(parsed.get("reason", "")).strip() or "Validator did not provide a reason"

@@ -138,8 +138,15 @@ Good decomposition (3 steps: search for products -> compile comparison -> genera
 Return only valid JSON. Do not include markdown fences, prose, or extra keys."""
 
 PLANNER_USER_PROMPT_TEMPLATE = (
-    "Decompose this task into 2-10 executable steps with explicit dependencies. "
-    "Maximize parallelism where possible: {original_input}"
+    "Decompose this task into the FEWEST steps that do it well (between 1 and {max_steps}). "
+    "A short writing, explanation or comparison task usually needs 1-3 steps; every extra step "
+    "costs time and can fail. Give independent steps no dependencies so they can run in parallel. "
+    "{tool_note}Task: {original_input}"
+)
+
+NO_WEB_NOTE = (
+    "No web search or external data access is available: do not plan research, search or "
+    "data-gathering steps; plan steps that work from general knowledge and the task itself. "
 )
 
 STRICT_JSON_SUFFIX = (
@@ -196,7 +203,7 @@ def validate_step_order(steps: List[StepDefinition]) -> List[StepDefinition]:
 
 
 async def planner_node(state: AgentState) -> AgentState:
-    """Decomposes user's task into 2-10 executable steps using LLM."""
+    """Decomposes the user's task into 1..MAX_PLAN_STEPS executable steps using the LLM."""
     planning_started = perf_counter()
     state["status"] = "planning"
 
@@ -222,7 +229,9 @@ async def planner_node(state: AgentState) -> AgentState:
                     system_prompt=PLANNER_SYSTEM_PROMPT,
                     temperature=0.2,
                     max_tokens=4096,
-                    json_mode=True,
+                    # The planner asks for a JSON array; JSON-object mode forces an object and broke the
+                    # output on Bedrock gpt-oss. The parser already extracts JSON from plain text.
+                    json_mode=False,
                     timeout=60,
                 )
                 llm_success_count += 1
@@ -267,17 +276,18 @@ async def planner_node(state: AgentState) -> AgentState:
 
         steps = validate_step_order(parsed_steps)
 
-        if len(steps) > 10:
+        max_steps = max(1, int(get_settings().MAX_PLAN_STEPS))
+        if len(steps) > max_steps:
             logger.warning("planner_step_count_truncated original=%s truncated=10", len(steps))
             state["error_log"].append(
                 {
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                     "step_id": "step_0",
                     "error_type": "PLANNER_TRUNCATED",
-                    "error_message": f"Planner returned {len(steps)} steps; truncated to 10.",
+                    "error_message": f"Planner returned {len(steps)} steps; truncated to {max_steps}.",
                 }
             )
-            steps = steps[:10]
+            steps = steps[:max_steps]
             allowed_ids = {step.step_id for step in steps}
             steps = [
                 step.model_copy(
@@ -293,18 +303,7 @@ async def planner_node(state: AgentState) -> AgentState:
             ]
             steps = validate_step_order(steps)
 
-        if len(steps) == 1:
-            review_step = StepDefinition(
-                step_id="step_2",
-                name="Review and finalize",
-                description="Review the previous result for completeness and finalize the response.",
-                tool_needed="llm_only",
-                dependencies=[steps[0].step_id],
-                estimated_complexity="low",
-            )
-            steps.append(review_step)
-
-        if len(steps) < 2:
+        if not steps:
             steps = _build_fallback_steps()
 
         steps = _renumber_steps(steps)
@@ -349,8 +348,12 @@ async def planner_node(state: AgentState) -> AgentState:
 
 
 def _build_user_prompt(original_input: str, strict_mode: bool) -> str:
-    """Build user prompt with optional strict JSON recovery instructions."""
-    prompt = PLANNER_USER_PROMPT_TEMPLATE.format(original_input=original_input)
+    """Build the planner prompt, telling the model which tools exist on this deployment."""
+    settings = get_settings()
+    tool_note = "" if settings.tavily_api_key else NO_WEB_NOTE
+    prompt = PLANNER_USER_PROMPT_TEMPLATE.format(
+        original_input=original_input, max_steps=max(1, int(settings.MAX_PLAN_STEPS)), tool_note=tool_note
+    )
     if strict_mode:
         prompt = f"{prompt}\n\n{STRICT_JSON_SUFFIX}"
     return prompt

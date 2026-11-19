@@ -3,10 +3,10 @@
 A multi-step, multi-agent task runner built on **LangGraph** that keeps working when models fail. A planner splits a task into a dependency graph of steps. A supervisor hands each step to a specialist agent (research, code, analysis, writing) that runs a ReAct loop with its own tools. Every answer is validated, and failing steps are retried with the reviewer's feedback or repaired by a reflector. Model calls go through retries, a fallback chain of models and per-model circuit breakers. Run state is checkpointed after every wave of steps, so an interrupted run resumes where it stopped.
 
 **What is measured, and how:**
-- **91 deterministic unit tests** run against a scripted fake model: no network, no Redis, no keys.
+- **98 deterministic unit tests** run against a scripted fake model: no network, no Redis, no keys.
 - **A mutation check** injects 14 bugs into the core logic, and the tests catch 14 of 14 ([details and history](docs/mutation-results.md)).
 - **A reproducible eval** runs 1,080 times on a *simulated* model with injected faults ([report](backend/eval/results/simulated.md)). It measures recovery, not answer quality.
-- **Real-model answer quality has not been measured yet** (see [Limits](#limits)).
+- **A live eval on Amazon Bedrock** compares the full system with a single model call on 40 tasks, AI-graded. The first version lost clearly; after the fixes it found, the two tie on quality and the full system costs about 3x ([below](#live-eval-amazon-bedrock)).
 
 ## How it works
 
@@ -75,6 +75,38 @@ Both diagrams match the compiled graphs (`build_graph(...).get_graph().draw_merm
 
 "Good" means every delivered part passes the simulator's ground truth. The intervals, call counts and token counts are in the [report](backend/eval/results/simulated.md), and every run's raw record is in `simulated.jsonl`. **These are properties of the simulator**: it picks the failure rates, its judge is perfect, and reflection gets no built-in advantage beyond an extra attempt. The numbers show that the mechanisms work as designed and how the three systems compare. They say nothing about real-world reliability or answer quality. The full system spends about 13–23 model calls per task where naive spends one.
 
+## Live eval (Amazon Bedrock)
+
+`python -m eval.run --live --bedrock` runs the same 40 tasks on real models in `ap-south-1`. All models are in-Region and on demand: `gpt-oss-120b` is primary, `qwen3-32b` is the fallback, and `gpt-oss-20b` is the judge. The comparison is the full system against `naive`, a single call to the primary model. `python -m eval.grade` then scores each answer against its task rubric with `qwen3-32b`, a different model from the one that wrote the answers. **These scores are AI-graded, not human-reviewed.** Re-grading the same naive answers moved coverage by 0.8 points (95% CI 0.0–2.5), which gives a sense of the grader's noise.
+
+| Run | Rubric coverage, naive | Rubric coverage, full | Full − naive, paired (95% CI) | Cost per task, naive / full | Time per task, naive / full |
+|---|---|---|---|---|---|
+| v1 | 90.0% | 73.3% | **−16.7 pp (−27.5 to −5.8)** | $0.0014 / $0.0148 | 6 s / 52 s |
+| v2 | 90.8% | 94.2% | +3.3 pp (−1.7 to +8.3) | $0.0014 / $0.0042 | 6 s / 13 s |
+
+**v1 lost, and the losses were bugs:**
+- The planner split even short writing tasks into 6–10 steps, including "research" steps when no search tool existed. The judge rejected those steps, which caused 55 retries and 59 reflection visits.
+- The finalizer passed only the first 500 characters of each step to the synthesis prompt, so most of the agents' work never reached the final answer.
+- Three plans failed outright.
+
+**v2** applies the fixes:
+- The planner is asked for the fewest steps (1–6) and is told when no web search exists.
+- Single-step plans are allowed.
+- The synthesis prompt receives 3,000 characters per step and is told to write the deliverable itself.
+
+With those fixes, all 40 tasks completed, with an average of 1.55 steps. Per task, the full system won 7, tied 30 and lost 3 against naive. The quality difference is within noise.
+
+**Reading:** with a capable model and no injected faults, the multi-agent machinery adds cost and time without a measurable quality gain. The simulated eval above shows where it pays off: provider failures and outages.
+
+Things the live run also found and fixed:
+- gpt-oss returns its reasoning inline as `<reasoning>…</reasoning>`. This is now stripped.
+- Bedrock's JSON-object mode returns a doubled opening brace. JSON is now extracted from plain text instead.
+- Planner JSON broke under JSON-object mode, because the planner asks for an array.
+- Several token limits were too small for reasoning models.
+- `LLM_REASONING_EFFORT=low` roughly halved gpt-oss output tokens in one check.
+
+Raw records and reports: `backend/eval/results/live-v1*` and `live-v2*`. Total model spend for both runs, pilots and grading was about $1.1 by the recorded token counts. AWS Billing is the authority.
+
 ## Run it
 
 ```bash
@@ -128,7 +160,8 @@ Endpoints that change process-wide settings need `X-Admin-Key`, so a public depl
 
 ## Limits
 
-- **No real-model eval yet.** The Hugging Face free credits this project used ran out (HTTP 402). `python -m eval.run --live` records answers, rubric items, real token counts and time with any configured endpoint, but scoring those answers has not been done. Make no quality claim until it is.
+- **The live eval is AI-graded** by one model on 40 tasks with three rubric points each. It is a comparison between systems, not a human-validated quality score. The v2 fixes were made after seeing v1 on the same tasks, so v2 is not an independent held-out result.
+- **The public demo does not answer yet.** It still points at the Hugging Face router, whose free credits ran out (HTTP 402). The Bedrock runs used a short-term key from a local login. A hosted demo needs a long-lived credential set by the owner.
 - **Python execution is not sandboxed**: there is no network isolation. Keep `ENABLE_CODE_EXEC=false` anywhere untrusted users can submit tasks.
 - **Resume granularity is one step.** A step that was running when the process died runs again from its start. Its model calls are not idempotent, so they are repeated (and paid for again).
 - **The in-memory checkpointer** (the default) loses runs on restart. Use SQLite or Postgres to resume across restarts.
@@ -149,7 +182,7 @@ backend/
   services/                 LLM client, usage records, LLM metrics, Redis streams
   eval/                     tasks, simulator, runner, report, results
   scripts/mutation_check.py
-  tests/unit/               91 tests with a scripted fake model
+  tests/unit/               98 tests with a scripted fake model
 frontend/                   React + Vite dashboard
 ```
 

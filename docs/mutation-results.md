@@ -1,4 +1,4 @@
-# Mutation check (2026-11-18)
+# Mutation check (2026-11-19)
 
 14 of 14 injected bugs caught by the unit tests (`python scripts/mutation_check.py`).
 

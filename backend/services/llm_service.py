@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from dataclasses import dataclass
 import logging
 from time import perf_counter
@@ -157,10 +158,10 @@ async def _call_llm_inner(
                 json_mode=json_mode,
                 timeout=timeout,
             )
-            text = _extract_openai_text(response)
+            finish_reason = str(getattr((getattr(response, "choices", None) or [None])[0], "finish_reason", "") or "")
+            text = strip_reasoning(_extract_openai_text(response), truncated=finish_reason == "length")
             tokens_used = _extract_openai_tokens(response)
             input_tokens, output_tokens = _usage_split(response, "prompt_tokens", "completion_tokens")
-            finish_reason = str(getattr((getattr(response, "choices", None) or [None])[0], "finish_reason", "") or "")
             model_used = str(getattr(response, "model", model) or model)
         else:
             response = await _call_anthropic(
@@ -249,8 +250,11 @@ async def _call_openai(
         ],
         "max_tokens": max_tokens,
     }
-    if get_settings().LLM_SEND_TEMPERATURE:
+    settings = get_settings()
+    if settings.LLM_SEND_TEMPERATURE:
         request_kwargs["temperature"] = temperature
+    if settings.LLM_REASONING_EFFORT:
+        request_kwargs["extra_body"] = {"reasoning_effort": settings.LLM_REASONING_EFFORT}
     if json_mode:
         request_kwargs["response_format"] = {"type": "json_object"}
 
@@ -306,6 +310,27 @@ async def _call_anthropic(
         ),
         timeout=timeout,
     )
+
+
+_REASONING_BLOCK = re.compile(r"<(reasoning|think|thinking)>.*?</\1>", re.DOTALL | re.IGNORECASE)
+_UNCLOSED_REASONING = re.compile(r"^\s*<(reasoning|think|thinking)>.*", re.DOTALL | re.IGNORECASE)
+
+
+def strip_reasoning(text: str, truncated: bool = False) -> str:
+    """Remove inline chain-of-thought blocks some models put in the answer text.
+
+    Reasoning models served through OpenAI-compatible endpoints (for example gpt-oss on
+    Bedrock) return "<reasoning>...</reasoning>" before the answer; Qwen uses "<think>". Left
+    in, it corrupts answers and JSON parsing. An unclosed block is dropped only when the
+    response was cut off by the token limit (then no answer was produced); otherwise the text
+    is kept, because some replies omit the closing tag and put the answer after it.
+    """
+    cleaned = _REASONING_BLOCK.sub("", text or "")
+    if truncated:
+        cleaned = _UNCLOSED_REASONING.sub("", cleaned)
+    else:
+        cleaned = re.sub(r"^\s*<(reasoning|think|thinking)>", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
 
 
 def _extract_openai_text(response: Any) -> str:

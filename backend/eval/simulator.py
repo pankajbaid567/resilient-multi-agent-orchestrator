@@ -71,7 +71,7 @@ class SimulatedProvider:
 
     def _respond(self, role: str, prompt: str) -> str:
         if role == "planner":
-            match = re.search(r"Maximize parallelism where possible: (.*)", prompt, re.DOTALL)
+            match = re.search(r"Task: (.*)", prompt, re.DOTALL)
             self.task_text = (match.group(1).strip() if match else prompt)[:300]
             return json.dumps(plan_for(self.task_text, self.category))
         if role == "supervisor":

@@ -13,6 +13,10 @@ from services.metrics_service import get_metrics_service
 
 logger = logging.getLogger(__name__)
 
+# Earlier versions passed only 500 characters per step, so most of the agents' work never
+# reached the final answer.
+SYNTHESIS_CHARS_PER_STEP = 3_000
+
 
 def final_result_per_step(state: AgentState) -> list:
     """Return the last recorded result for each step.
@@ -216,7 +220,7 @@ def _build_synthesis_prompt(state: AgentState) -> str:
 
     for index, result in enumerate(state["step_results"], start=1):
         step_name = step_name_by_id.get(result.step_id, result.step_id)
-        truncated_output = (result.output or "")[:500]
+        truncated_output = (result.output or "")[:SYNTHESIS_CHARS_PER_STEP]
         result_lines.append(f"Step {index} ({step_name}): {truncated_output}")
 
         if result.status != "success":
@@ -233,7 +237,9 @@ def _build_synthesis_prompt(state: AgentState) -> str:
     joined_non_success = "\n".join(non_success_lines)
 
     return (
-        "You are a report synthesizer. Combine these step results into a clear, well-structured final output.\n\n"
+        "You are a report synthesizer. Combine these step results into a clear, well-structured final output.\n"
+        "Write the final deliverable the task asks for (the comparison, plan, explanation, email, ...), not a "
+        "description of how it was produced. Keep every concrete fact, number and recommendation from the steps.\n\n"
         f"Original Task: {state['original_input']}\n\n"
         "Step Results:\n"
         f"{joined_results}\n\n"

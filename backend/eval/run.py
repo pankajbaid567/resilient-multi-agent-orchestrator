@@ -46,8 +46,9 @@ PROFILES = ("clean", "chaos", "outage")
 FULL_BODY_END = "clear conclusion for this part of the task."
 
 
-def load_tasks(limit: int | None) -> list[dict]:
+def load_tasks(limit: int | None, start: int = 0) -> list[dict]:
     tasks = [json.loads(line) for line in (HERE / "tasks.jsonl").read_text().splitlines() if line.strip()]
+    tasks = tasks[start:]
     return tasks[:limit] if limit else tasks
 
 
@@ -97,7 +98,7 @@ async def run_naive(task: dict, task_id: str) -> dict:
                 middleware.enabled = True
                 injection = await middleware.maybe_inject("naive")
             response = await call_llm(prompt=task["task"], system_prompt="naive-baseline: answer the task directly.",
-                                      model=get_settings().primary_model, max_tokens=1500)
+                                      model=get_settings().primary_model, max_tokens=4096)
             output = response.text if injection != "CORRUPT" else response.text[: len(response.text) // 2]
         except LLMError as exc:
             error = type(exc).__name__
@@ -180,7 +181,7 @@ async def _run_and_record(task: dict, system: str, profile: str, seed: int, live
 
 
 async def main_async(args) -> Path:
-    tasks = load_tasks(args.limit)
+    tasks = load_tasks(args.limit, args.start)
     systems = args.systems or (("naive", "full") if args.live else SYSTEMS)
     profiles = args.profiles or (("clean",) if args.live else PROFILES)
     label = args.label or ("live" if args.live else "simulated")
@@ -211,6 +212,7 @@ def main() -> None:
     parser.add_argument("--profiles", nargs="*", choices=PROFILES)
     parser.add_argument("--seeds", nargs="*", type=int, default=[1])
     parser.add_argument("--limit", type=int, default=None, help="only the first N tasks")
+    parser.add_argument("--start", type=int, default=0, help="skip the first N tasks (run in chunks)")
     parser.add_argument("--label", default=None)
     parser.add_argument("--bedrock", action="store_true", help="live run on Amazon Bedrock (short-term API key)")
     parser.add_argument("--region", default="ap-south-1")

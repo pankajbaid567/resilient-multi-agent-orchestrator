@@ -8,7 +8,6 @@ SUPERVISOR_MODE=rules), deterministic rules pick the worker and the step text is
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-import json
 import logging
 import re
 from typing import Optional
@@ -16,6 +15,7 @@ from typing import Optional
 from config import get_settings
 from models import StepDefinition
 from agent.reliability.fallback import complete
+from services.json_extract import extract_json_object
 from services.llm_service import LLMError
 
 from .agents import AGENT_REGISTRY, ANALYSIS_AGENT
@@ -78,18 +78,7 @@ def _roster() -> str:
 
 
 def _parse(raw: str) -> Optional[dict]:
-    text = (raw or "").strip()
-    fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
-    if fenced:
-        text = fenced.group(1)
-    start, end = text.find("{"), text.rfind("}")
-    if start == -1 or end <= start:
-        return None
-    try:
-        parsed = json.loads(text[start : end + 1])
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
+    return extract_json_object(raw)
 
 
 async def delegate(step: StepDefinition, original_input: str, context: str = "") -> Delegation:
@@ -113,7 +102,7 @@ async def delegate(step: StepDefinition, original_input: str, context: str = "")
             prompt=prompt,
             system_prompt=SUPERVISOR_SYSTEM_PROMPT,
             temperature=0.0,
-            max_tokens=300,
+            max_tokens=1000,
             json_mode=True,
             timeout=30,
         )

@@ -10,6 +10,7 @@ from typing import Any
 
 from models import StepDefinition
 from agent.reliability.fallback import complete
+from services.json_extract import extract_json_object
 from services.llm_service import LLMError
 
 logger = logging.getLogger(__name__)
@@ -85,7 +86,7 @@ async def _get_reflection_decision(prompt: str) -> tuple[dict[str, Any], str, in
             prompt=prompt,
             system_prompt=REFLECTOR_SYSTEM_PROMPT,
             temperature=0.2,
-            max_tokens=1200,
+            max_tokens=2000,
             json_mode=True,
             timeout=60,
         )
@@ -107,6 +108,9 @@ async def _get_reflection_decision(prompt: str) -> tuple[dict[str, Any], str, in
 
 def _parse_reflection_response(raw_text: str) -> dict[str, Any]:
     """Parse reflection response via JSON, then heuristic extraction if parsing fails."""
+    extracted = extract_json_object(raw_text)
+    if isinstance(extracted, dict):
+        return _normalize_decision_dict(extracted)
     payload = _extract_json_payload(raw_text)
     candidates = [payload, raw_text]
 

@@ -45,6 +45,9 @@ def configure_bedrock_env(region: str, profile: str | None = None) -> None:
         "VALIDATION_MODEL": DEFAULT_MODELS["judge"],
         "MODEL_CHAIN": f"{DEFAULT_MODELS['primary']},{DEFAULT_MODELS['fallback']}",
         "MODEL_PRICES": json.dumps(PRICES_USD_PER_1M),
+        # gpt-oss writes long hidden reasoning by default; "low" cut planner output tokens by about
+        # half in a check on 2026-11-19 while keeping valid JSON.
+        "LLM_REASONING_EFFORT": os.environ.get("LLM_REASONING_EFFORT", "low"),
         "REDIS_URL": os.environ.get("REDIS_URL", "redis://127.0.0.1:1"),
         "CHECKPOINT_URL": "memory",
         "ENABLE_CODE_EXEC": "false",

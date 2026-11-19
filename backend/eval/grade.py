@@ -14,7 +14,6 @@ import argparse
 import asyncio
 import json
 import os
-import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -35,12 +34,10 @@ def grading_prompt(task: str, rubric: list[str], answer: str) -> str:
 
 
 def parse_grade(text: str, rubric: list[str]) -> dict | None:
-    match = re.search(r"\{.*\}", text or "", re.DOTALL)
-    if not match:
-        return None
-    try:
-        data = json.loads(match.group(0))
-    except json.JSONDecodeError:
+    from services.json_extract import extract_json_object
+
+    data = extract_json_object(text)
+    if data is None:
         return None
     covered_raw = {str(k).strip().lower(): bool(v) for k, v in (data.get("covered") or {}).items()}
     covered = {item: covered_raw.get(item.lower(), False) for item in rubric}

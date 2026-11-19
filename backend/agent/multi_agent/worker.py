@@ -147,7 +147,7 @@ async def _run_worker(
                 prompt=prompt,
                 system_prompt=system_prompt,
                 temperature=agent.temperature,
-                max_tokens=2048,
+                max_tokens=4096,
                 timeout=max(1, int(settings.STEP_TIMEOUT)),
                 task_id=task_id,
                 step_id=step.step_id,

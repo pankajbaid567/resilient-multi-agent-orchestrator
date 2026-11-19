@@ -122,3 +122,19 @@ def test_state_reducers_upsert_steps_and_keep_first_abort_reason():
     assert merged[0].description == "rewritten"
     assert merge_dict({"a": 1, "b": 1}, {"b": 2}) == {"a": 1, "b": 2}
     assert first_reason(None, "x") == "x" and first_reason("first", "second") == "first"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ['{\n{"verdict": "pass", "scores": {"a": 9}}', 'Here you go:\n```json\n{"verdict": "pass"}\n```',
+     'noise {not json} then {"verdict": "pass"} trailing'],
+)
+def test_json_extraction_survives_provider_artefacts(raw):
+    from services.json_extract import extract_json_object
+
+    assert extract_json_object(raw)["verdict"] == "pass"
+
+
+def test_judge_parses_doubled_brace_output():
+    raw = '{\n{"verdict":"pass","reason":"ok","scores":{"relevance":9,"completeness":8,"consistency":9,"plausibility":9}}}'
+    assert _parse_validation_response(raw)["verdict"] == "pass"

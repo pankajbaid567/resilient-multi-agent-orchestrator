@@ -195,3 +195,37 @@ async def test_every_role_survives_a_primary_model_outage(fake_llm, settings, mo
     assert final["final_output"]["summary"]["outcome"] == "complete"
     assert "primary-model" not in {c["model"] for c in final["llm_calls"] if c["ok"]}
     assert {c["node"] for c in final["llm_calls"] if c["model"] == "backup-model" and c["ok"]} >= {"planner", "execute", "finalizer"}
+
+
+def test_inline_reasoning_is_stripped_from_answers():
+    from services.llm_service import strip_reasoning
+
+    assert strip_reasoning("<reasoning>think hard</reasoning>ok") == "ok"
+    assert strip_reasoning("<think>\nplan\n</think>\n{\"a\": 1}") == '{"a": 1}'
+    assert strip_reasoning("<reasoning>cut off by the token limit", truncated=True) == ""
+    # unclosed tag but the model finished: keep the text so the answer after it survives
+    assert strip_reasoning('<reasoning>short note {"verdict": "pass"}').endswith('{"verdict": "pass"}')
+    assert strip_reasoning("plain answer with <b>html</b>") == "plain answer with <b>html</b>"
+
+
+async def test_reasoning_effort_is_sent_when_configured(monkeypatch, settings):
+    import services.llm_service as llm
+
+    sent: dict = {}
+
+    class Completions:
+        async def create(self, **kwargs):
+            sent.update(kwargs)
+            raise asyncio.TimeoutError()
+
+    class Client:
+        chat = type("Chat", (), {"completions": Completions()})()
+
+    monkeypatch.setattr(llm, "get_openai_client", lambda: Client())
+    with pytest.raises(LLMTimeoutError):
+        await call_llm("hi", timeout=1)
+    assert "extra_body" not in sent
+    settings.LLM_REASONING_EFFORT = "low"
+    with pytest.raises(LLMTimeoutError):
+        await call_llm("hi", timeout=1)
+    assert sent["extra_body"] == {"reasoning_effort": "low"}
