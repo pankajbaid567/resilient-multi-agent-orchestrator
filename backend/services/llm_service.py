@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 from dataclasses import dataclass
 import logging
 from time import perf_counter
@@ -69,23 +70,44 @@ class LLMResponse:
         return self.finish_reason in {"length", "max_tokens"}
 
 
+_openai_client_created_at = 0.0
+BEDROCK_KEY_REFRESH_SECONDS = 45 * 60  # short-term keys last up to 12 h; refresh well before
+
+
+def _bedrock_role_key(region: str) -> str:
+    """Short-term Bedrock API key signed with the machine's IAM role credentials."""
+    from aws_bedrock_token_generator import provide_token
+
+    return provide_token(region=region)
+
+
 def get_openai_client() -> AsyncOpenAI:
-    """Return a lazily initialized singleton OpenAI async client."""
-    global _openai_client
-    if _openai_client is None:
-        settings = get_settings()
-        api_key = (settings.open_source_api_key or settings.openai_api_key).strip()
-        if not api_key:
-            raise LLMConnectionError(
-                "No LLM API key configured. Set OPEN_SOURCE_API_KEY (recommended) or OPENAI_API_KEY."
-            )
+    """Return a lazily initialized OpenAI-compatible async client.
 
-        client_kwargs: dict[str, Any] = {"api_key": api_key}
-        # OPEN_SOURCE_API_KEY implies OpenAI-compatible open-source endpoint usage.
-        if settings.open_source_api_key and settings.open_source_base_url:
-            client_kwargs["base_url"] = settings.open_source_base_url
-
+    With BEDROCK_ROLE_KEY_REGION set, the API key is a short-term Bedrock key generated from
+    the instance role and the client is rebuilt every BEDROCK_KEY_REFRESH_SECONDS.
+    """
+    global _openai_client, _openai_client_created_at
+    settings = get_settings()
+    role_region = (settings.BEDROCK_ROLE_KEY_REGION or "").strip()
+    stale = role_region and (time.monotonic() - _openai_client_created_at) > BEDROCK_KEY_REFRESH_SECONDS
+    if _openai_client is None or stale:
+        if role_region:
+            api_key = _bedrock_role_key(role_region)
+            base_url = settings.open_source_base_url or f"https://bedrock-runtime.{role_region}.amazonaws.com/openai/v1"
+            client_kwargs: dict[str, Any] = {"api_key": api_key, "base_url": base_url}
+        else:
+            api_key = (settings.open_source_api_key or settings.openai_api_key).strip()
+            if not api_key:
+                raise LLMConnectionError(
+                    "No LLM API key configured. Set OPEN_SOURCE_API_KEY (recommended) or OPENAI_API_KEY."
+                )
+            client_kwargs = {"api_key": api_key}
+            # OPEN_SOURCE_API_KEY implies OpenAI-compatible open-source endpoint usage.
+            if settings.open_source_api_key and settings.open_source_base_url:
+                client_kwargs["base_url"] = settings.open_source_base_url
         _openai_client = AsyncOpenAI(**client_kwargs)
+        _openai_client_created_at = time.monotonic()
     return _openai_client
 
 

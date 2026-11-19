@@ -73,6 +73,15 @@ class Settings(BaseSettings):
     ENABLE_CODE_EXEC: bool = False
     ENABLE_API_CALL: bool = False
     ADMIN_API_KEY: str | None = None
+    # Public-demo limits on POST /tasks (0 disables). TRUST_PROXY_HEADERS reads the client IP
+    # from X-Forwarded-For; enable it only behind a reverse proxy you run (e.g. Caddy).
+    TASKS_PER_IP_PER_HOUR: int = 0
+    DAILY_TASK_LIMIT: int = 0
+    TRUST_PROXY_HEADERS: bool = False
+    # Amazon Bedrock with the machine's IAM role: when set to a Region, the app generates a
+    # short-term Bedrock API key from the role credentials and refreshes it before it expires,
+    # so no long-lived secret is stored anywhere.
+    BEDROCK_ROLE_KEY_REGION: str = ""
 
     class Config:
         """Pydantic configuration for environment-based settings loading."""

@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from agent.graph import get_task_state, plan_task
 from agent.reliability.chaos import get_chaos_middleware, set_chaos_mode as set_chaos_runtime_mode
 from routes.execute import start_background_execution
-from security import require_admin
+from security import limit_task_creation, require_admin
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,7 @@ class ChaosModeResponse(BaseModel):
     stats: dict[str, int]
 
 
-@router.post("", response_model=TaskCreateResponse)
+@router.post("", response_model=TaskCreateResponse, dependencies=[Depends(limit_task_creation)])
 async def create_task(payload: TaskCreateRequest):
     """Create a task, run planning synchronously, checkpoint state, and return planned steps."""
     task_text = payload.task.strip()
