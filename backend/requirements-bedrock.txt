@@ -1,0 +1,4 @@
+# Optional: live eval against Amazon Bedrock (python -m eval.run --live --bedrock)
+aws-bedrock-token-generator==1.1.0
+boto3
+botocore[crt]

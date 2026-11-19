@@ -40,3 +40,13 @@ def test_report_counts_match_records(tmp_path):
     path.write_text("\n".join(json.dumps(r) for r in rows))
     report = write_report(path).read_text()
     assert "| clean | full | 4 | 50.0%" in report
+
+
+def test_grade_parser_matches_rubric_items_case_insensitively():
+    from eval.grade import parse_grade
+
+    text = 'Sure: {"covered": {"COST": true, "maintenance": false}, "score": 9, "reason": "ok"}'
+    grade = parse_grade(text, ["cost", "maintenance", "recommendation"])
+    assert grade["covered"] == {"cost": True, "maintenance": False, "recommendation": False}
+    assert grade["score"] == 5  # clamped to 1-5
+    assert parse_grade("no json here", ["cost"]) is None

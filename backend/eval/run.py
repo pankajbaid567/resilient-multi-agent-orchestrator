@@ -3,6 +3,8 @@
     cd backend && python -m eval.run                       # simulated provider (default)
     cd backend && python -m eval.run --seeds 1 2 3         # more seeds
     cd backend && python -m eval.run --live --limit 10     # real provider from .env (costs tokens)
+    cd backend && python -m eval.run --live --bedrock --profile <aws-profile>   # Amazon Bedrock, short-term key
+    cd backend && python -m eval.grade eval/results/live.jsonl                  # rubric grading of live answers
 
 Systems
   naive       one model call per task: no plan, no validation, no retries, no fallback
@@ -99,7 +101,10 @@ async def run_naive(task: dict, task_id: str) -> dict:
             output = response.text if injection != "CORRUPT" else response.text[: len(response.text) // 2]
         except LLMError as exc:
             error = type(exc).__name__
-    return {"answered": bool(output.strip()), "good": good_output(output), "status": "completed" if output else "failed",
+    from config import get_settings
+
+    live = not get_settings().OPEN_SOURCE_BASE_URL.startswith("http://simulated")
+    return {"answered": bool(output.strip()), "good": None if live else good_output(output), "status": "completed" if output else "failed",
             "outcome": "complete" if output else "failed", "steps": 0, "steps_success": 0, "llm_calls": calls,
             "retries": 0, "reflections": 0, "error": error, "answer": output}
 
@@ -112,8 +117,11 @@ async def run_graph(task: dict, task_id: str) -> dict:
     results = final_results_by_step(final)
     steps = final.get("steps") or []
     steps_success = sum(1 for r in results.values() if r.status == "success")
-    good = bool(steps) and len(results) == len(steps) and all(
-        r.status == "success" and good_output(r.output) for r in results.values())
+    from config import get_settings
+
+    simulated = get_settings().OPEN_SOURCE_BASE_URL.startswith("http://simulated")
+    good = (bool(steps) and len(results) == len(steps) and all(
+        r.status == "success" and good_output(r.output) for r in results.values())) if simulated else None
     summary = (final.get("final_output") or {}).get("summary") or {}
     return {"answered": final.get("status") == "completed" and steps_success > 0,
             "good": good, "status": final.get("status"), "outcome": summary.get("outcome"), "steps": len(steps),
@@ -162,6 +170,8 @@ async def _run_and_record(task: dict, system: str, profile: str, seed: int, live
               "seed": seed, "mode": "live" if live else "simulated", **outcome,
               "calls": usage["calls"], "failed_calls": usage["failed_calls"], "tokens": usage["total_tokens"],
               "fallbacks": usage["fallbacks"], "provider_retries": usage["provider_retries"],
+              "input_tokens": usage["input_tokens"], "output_tokens": usage["output_tokens"],
+              "cost_usd": usage["cost_usd"], "llm_latency_p50_ms": usage["latency_ms"]["p50"],
               "wall_ms": int((time.perf_counter() - started) * 1000)}
     if live:
         record["answer"] = answer[:4000]
@@ -202,7 +212,16 @@ def main() -> None:
     parser.add_argument("--seeds", nargs="*", type=int, default=[1])
     parser.add_argument("--limit", type=int, default=None, help="only the first N tasks")
     parser.add_argument("--label", default=None)
+    parser.add_argument("--bedrock", action="store_true", help="live run on Amazon Bedrock (short-term API key)")
+    parser.add_argument("--region", default="ap-south-1")
+    parser.add_argument("--profile", default=None, help="AWS profile for the short-term Bedrock key")
     args = parser.parse_args()
+    if args.bedrock:
+        args.live = True
+        sys.path.insert(0, str(BACKEND))
+        from eval.bedrock import configure_bedrock_env
+
+        configure_bedrock_env(args.region, args.profile)  # before app imports
     if not args.live:
         os.environ.update(SIM_ENV)  # before app imports: no real keys, no network, no Redis
     sys.path.insert(0, str(BACKEND))
