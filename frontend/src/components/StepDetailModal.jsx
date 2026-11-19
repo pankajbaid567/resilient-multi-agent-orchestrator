@@ -1,6 +1,7 @@
 import { AnimatePresence, motion } from "framer-motion";
 import { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   Bar,
   BarChart,
@@ -225,6 +226,7 @@ export default function StepDetailModal({
                   <div className="max-h-[52vh] overflow-auto rounded-xl border border-white/10 bg-[#0b1733] p-4 text-sm leading-relaxed text-slate-100">
                     {details.response ? (
                       <ReactMarkdown
+                        remarkPlugins={[remarkGfm]}
                         components={{
                           h1: ({ children }) => <h1 className="mb-2 mt-3 text-lg font-semibold">{children}</h1>,
                           h2: ({ children }) => <h2 className="mb-2 mt-3 text-base font-semibold">{children}</h2>,

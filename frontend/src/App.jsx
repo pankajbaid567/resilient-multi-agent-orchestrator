@@ -2,6 +2,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import ExecutionFlowGraph from "./components/ExecutionFlowGraph";
 import LiveLogs from "./components/LiveLogs";
 import MetricsDashboard from "./components/MetricsDashboard";
@@ -126,7 +127,16 @@ export default function App() {
     }
   }, []);
 
+  const recentToastsRef = useRef(new Map());
+
   const pushToast = useCallback((message, variant = "info", ttl = 3800) => {
+    // The same event can arrive twice (live WebSocket and trace refresh); show it once.
+    const now = Date.now();
+    const lastShown = recentToastsRef.current.get(message);
+    if (lastShown && now - lastShown < 10000) {
+      return;
+    }
+    recentToastsRef.current.set(message, now);
     const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const nextToast = { id, message, variant };
 
@@ -569,7 +579,7 @@ function ExecuteView({
             <section className="rounded-2xl border border-white/10 bg-[var(--bg-card)]/70 p-4">
               <p className="mb-2 text-xs uppercase tracking-wide text-[var(--text-secondary)]">Final Output Preview</p>
               <div className="prose prose-sm prose-invert max-w-none max-h-96 overflow-y-auto leading-relaxed">
-                <ReactMarkdown>{String(task.final_output.result)}</ReactMarkdown>
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{cleanModelMarkdown(task.final_output.result)}</ReactMarkdown>
               </div>
             </section>
           ) : null}
@@ -1226,4 +1236,10 @@ function AnimatedBackground() {
       />
     </div>
   );
+}
+
+// Models put <br> inside markdown table cells. Raw HTML from a model is never rendered (XSS), so
+// line-break tags become a visible separator instead.
+function cleanModelMarkdown(text) {
+  return String(text || "").replace(/<br\s*\/?>/gi, " · ");
 }
